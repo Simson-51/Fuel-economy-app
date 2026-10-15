@@ -91,6 +91,15 @@ function computeStats(rows) {
     s.kmL = 100 / s.avgCons;
     const last5 = segs.slice(-5);
     s.cons5 = sum(last5, r => r.segL) / sum(last5, r => r.segKm) * 100;
+  } else if (rows.length >= 2 && s.kmTracked > 0) {
+    // Senza due pieni: il carburante bruciato tra il primo e l'ultimo rifornimento è circa
+    // la somma dei litri messi prima dell'ultimo. L'errore è la differenza di livello nel
+    // serbatoio tra il primo e l'ultimo, quindi la stima migliora con il passare dei km.
+    const prev = rows.slice(0, -1);
+    s.avgCons = sum(prev, r => r.liters) / s.kmTracked * 100;
+    s.costKm = sum(prev, r => r.total) / s.kmTracked;
+    s.kmL = 100 / s.avgCons;
+    s.estimated = true;
   }
   const days = (parseDate(rows[rows.length - 1].date) - parseDate(rows[0].date)) / 864e5;
   if (days >= 30 && s.kmTracked > 0) {
@@ -134,7 +143,7 @@ const emptyState = () => `
   <div class="card empty">
     <div class="ico">⛽</div>
     <h3>Nessun rifornimento</h3>
-    <p class="muted">Aggiungi il primo rifornimento con il tasto <b>+</b>. Per calcolare i consumi servono almeno due pieni.</p>
+    <p class="muted">Aggiungi il primo rifornimento con il tasto <b>+</b>. Dal secondo rifornimento vedrai una stima dei consumi, che diventa precisa con due pieni.</p>
     <button class="btn" data-act="add">Aggiungi rifornimento</button>
   </div>`;
 
@@ -143,7 +152,13 @@ function renderHome(el) {
   const s = stats();
   if (!s.n) { el.innerHTML = emptyState(); return; }
   let html = '';
-  if (s.avgCons) {
+  if (s.estimated) {
+    html += `<div class="card hero">
+      <div class="label">Consumo medio stimato</div>
+      <div class="big">${nf(s.avgCons, 2)} <small>L/100 km</small></div>
+      <div class="sub">${nf(s.kmL, 1)} km/L · stima su ${nf(s.kmTracked, 0)} km da tutti i rifornimenti. Diventa precisa con due pieni (o con tanti km).</div>
+    </div>`;
+  } else if (s.avgCons) {
     const diff = s.last.cons - s.avgCons;
     const trend = Math.abs(diff) < 0.05 ? 'in linea con la media'
       : `${diff < 0 ? '▼' : '▲'} ${nf(Math.abs(diff))} L/100 km ${diff < 0 ? 'meglio' : 'peggio'} della media`;
@@ -331,7 +346,7 @@ function renderCharts(el) {
       + `<p class="muted small" style="margin:6px 0 0">Linea tratteggiata: media ${nf(s.avgCons, 2)} L/100 km</p>`);
     html += card('Costo al km (€)', lineChart([{ name: 'Costo/km', color: COLORS[0], pts: segPts('costKm', 3, '€/km') }], labels, { dec: 3, ref: s.costKm }));
   } else {
-    html += card('Consumo', '<p class="muted" style="margin:0">Il grafico dei consumi appare dopo almeno due pieni.</p>');
+    html += card('Consumo', `<p class="muted" style="margin:0">Il grafico dei consumi per pieno appare dopo almeno due pieni.${s.estimated ? ` Per ora il consumo medio stimato è ${nf(s.avgCons, 2)} L/100 km.` : ''}</p>`);
   }
   const eff = { name: 'Prezzo pagato', color: COLORS[0], pts: rows.map((r, i) => ({ x: i, y: r.price, tip: `${fmtDate(r.date)} · pagato ${eur(r.price, 3)}/L` })) };
   const pumpPts = rows.map((r, i) => r.pump ? { x: i, y: r.pump, tip: `${fmtDate(r.date)} · pompa ${eur(r.pump, 3)}/L` } : null).filter(Boolean);
@@ -360,7 +375,8 @@ const ROUTE_NAME = { mixed: 'Misto', urban: 'Urbano', extra: 'Extraurbano', high
 function renderTrip(el) {
   const p = db.prefs.trip, s = stats(), v = vehicle();
   const hasHist = !!s.avgCons;
-  const consSrc = p.consSrc || (hasHist ? 'avg' : 'manual');
+  let consSrc = p.consSrc || (hasHist ? 'avg' : 'vehicle');
+  if ((consSrc === 'last5' && (!hasHist || s.estimated)) || (consSrc === 'avg' && !hasHist)) consSrc = 'vehicle';
   const priceSrc = p.priceSrc || (s.n ? 'avg' : 'manual');
   const sel = (val, cur, label) => `<option value="${val}" ${val === cur ? 'selected' : ''}>${label}</option>`;
   el.innerHTML = `
@@ -377,7 +393,8 @@ function renderTrip(el) {
   </div>
   <div class="card"><h2>Consumo del veicolo</h2>
     <div class="field"><select id="tConsSrc" aria-label="Origine consumo">
-      ${hasHist ? sel('avg', consSrc, `Media storica (${nf(s.avgCons, 2)} L/100 km)`) + sel('last5', consSrc, `Ultimi 5 pieni (${nf(s.cons5, 2)} L/100 km)`) : ''}
+      ${s.estimated ? sel('avg', consSrc, `Stima dai rifornimenti (${nf(s.avgCons, 2)} L/100 km)`)
+        : hasHist ? sel('avg', consSrc, `Media storica (${nf(s.avgCons, 2)} L/100 km)`) + sel('last5', consSrc, `Ultimi 5 pieni (${nf(s.cons5, 2)} L/100 km)`) : ''}
       ${sel('vehicle', consSrc, 'Dati inseriti nel veicolo')}${sel('manual', consSrc, 'Manuale')}
     </select></div>
     <div class="field" id="tConsManualBox"><label for="tConsManual">Consumo (L/100 km)</label><input id="tConsManual" inputmode="decimal" value="${esc(p.consManual || '')}" placeholder="es. 6,5"></div>
