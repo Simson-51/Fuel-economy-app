@@ -12,9 +12,18 @@ const num = v => {
 };
 const nf = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('it-IT', { minimumFractionDigits: d, maximumFractionDigits: d }) : '–';
 const eur = (n, d = 2) => Number.isFinite(n) ? n.toLocaleString('it-IT', { style: 'currency', currency: 'EUR', minimumFractionDigits: d, maximumFractionDigits: d }) : '–';
-const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const today = () => iso(new Date());
 const parseDate = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const fmtDate = s => parseDate(s).toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
+const addMonths = (s, m) => {
+  const d = parseDate(s), day = d.getDate();
+  d.setDate(1); d.setMonth(d.getMonth() + m);
+  d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+  return iso(d);
+};
+const addDays = (s, n) => { const d = parseDate(s); d.setDate(d.getDate() + n); return iso(d); };
+const daysBetween = (a, b) => Math.round((parseDate(b) - parseDate(a)) / 864e5);
 const fmtDateShort = s => parseDate(s).toLocaleDateString('it-IT', { day: '2-digit', month: 'short' });
 const monthKey = s => s.slice(0, 7);
 const monthLabel = k => { const [y, m] = k.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('it-IT', { month: 'short', year: '2-digit' }); };
@@ -31,13 +40,26 @@ function defaultDb() {
     vehicles: [{ id, name: 'Alfa Romeo Giulietta 1.4 MultiAir 170 CV', year: 2010, fuel: 'Benzina', tank: 60,
       // Valori dichiarati (ciclo NEDC); in autostrada non c'è un dato ufficiale
       cons: { urban: '7,6', extra: '4,8', mixed: '5,8', highway: '' } }],
+    maint: [], settings: defaultSettings(),
     prefs: { trip: {} },
   };
+}
+function defaultSettings() {
+  return { theme: 'auto', unit: 'l100', warnDays: 30, warnKm: 1000, factors: { urban: 1.2, extra: 0.9, highway: 1.1 } };
+}
+/** Completa i dati salvati da versioni precedenti (o da un backup) con i campi nuovi. */
+function normalize(d) {
+  d.prefs ||= {}; d.prefs.trip ||= {};
+  d.maint ||= [];
+  const def = defaultSettings();
+  d.settings = { ...def, ...d.settings, factors: { ...def.factors, ...d.settings?.factors } };
+  if (!d.vehicles.some(x => x.id === d.active)) d.active = d.vehicles[0].id;
+  return d;
 }
 function load() {
   try {
     const d = JSON.parse(localStorage.getItem(KEY));
-    if (d && Array.isArray(d.vehicles) && d.vehicles.length) { d.prefs ||= { trip: {} }; d.prefs.trip ||= {}; return d; }
+    if (d && Array.isArray(d.vehicles) && d.vehicles.length) return normalize(d);
   } catch (e) { /* dati assenti o corrotti */ }
   return defaultDb();
 }
@@ -46,6 +68,13 @@ function save() {
   try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast('Impossibile salvare i dati sul dispositivo'); }
 }
 const vehicle = () => db.vehicles.find(v => v.id === db.active) || db.vehicles[0];
+
+/* Unità di consumo scelta nelle impostazioni (i calcoli restano in L/100 km) */
+const kml = () => db.settings.unit === 'kml';
+const consVal = l100 => kml() ? 100 / l100 : l100;
+const consDec = () => kml() ? 1 : 2;
+const consUnit = () => kml() ? 'km/L' : 'L/100 km';
+const consFmt = (l100, short) => `${nf(consVal(l100), consDec())} ${short && !kml() ? 'L/100' : consUnit()}`;
 
 /* ============ Calcoli ============ */
 /**
@@ -121,16 +150,18 @@ function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
-const TITLES = { home: 'Riepilogo', log: 'Storico rifornimenti', charts: 'Grafici', trip: 'Calcola itinerario', vehicle: 'Veicolo e dati' };
+const TITLES = { home: 'Riepilogo', log: 'Storico', charts: 'Grafici', trip: 'Itinerario', maint: 'Manutenzione', settings: 'Impostazioni' };
 
 function render() {
   const v = vehicle();
   $('#title').textContent = TITLES[tab];
   $('#vehicleChip').textContent = `${v.name}${v.year ? ' ' + v.year : ''}`;
-  $$('#tabbar button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#fab').hidden = tab === 'trip' || tab === 'vehicle';
+  $$('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('#fab').hidden = tab === 'trip' || tab === 'settings';
+  $('#fab').setAttribute('aria-label', tab === 'maint' ? 'Aggiungi intervento' : 'Aggiungi rifornimento');
   const view = $('#view');
-  ({ home: renderHome, log: renderLog, charts: renderCharts, trip: renderTrip, vehicle: renderVehicle })[tab](view);
+  ({ home: renderHome, log: renderLog, charts: renderCharts, trip: renderTrip, maint: renderMaint, settings: renderSettings })[tab](view);
+  updateBadge();
 }
 function go(t) { tab = t; render(); window.scrollTo(0, 0); }
 
@@ -150,25 +181,29 @@ const emptyState = () => `
 /* ============ Riepilogo ============ */
 function renderHome(el) {
   const s = stats();
-  if (!s.n) { el.innerHTML = emptyState(); return; }
+  const due = deadlines().filter(d => d.status !== 'ok');
+  const dueCard = due.length ? `<div class="card"><h2>Scadenze manutenzione</h2><div class="list">${due.slice(0, 3).map(dueHtml).join('')}</div>
+    ${due.length > 3 ? `<button class="btn secondary block" style="margin-top:10px" data-tab="maint">Vedi tutte (${due.length})</button>` : ''}</div>` : '';
+  if (!s.n) { el.innerHTML = dueCard + emptyState(); return; }
   let html = '';
+  const other = l100 => kml() ? `${nf(l100, 2)} L/100 km` : `${nf(100 / l100, 1)} km/L`;
   if (s.estimated) {
-    html += `<div class="card hero">
+    html = dueCard + `<div class="card hero">
       <div class="label">Consumo medio stimato</div>
-      <div class="big">${nf(s.avgCons, 2)} <small>L/100 km</small></div>
-      <div class="sub">${nf(s.kmL, 1)} km/L · stima su ${nf(s.kmTracked, 0)} km da tutti i rifornimenti. Diventa precisa con due pieni (o con tanti km).</div>
+      <div class="big">${nf(consVal(s.avgCons), consDec())} <small>${consUnit()}</small></div>
+      <div class="sub">${other(s.avgCons)} · stima su ${nf(s.kmTracked, 0)} km da tutti i rifornimenti. Diventa precisa con due pieni (o con tanti km).</div>
     </div>`;
   } else if (s.avgCons) {
-    const diff = s.last.cons - s.avgCons;
+    const diff = consVal(s.last.cons) - consVal(s.avgCons), better = kml() ? diff > 0 : diff < 0;
     const trend = Math.abs(diff) < 0.05 ? 'in linea con la media'
-      : `${diff < 0 ? '▼' : '▲'} ${nf(Math.abs(diff))} L/100 km ${diff < 0 ? 'meglio' : 'peggio'} della media`;
-    html += `<div class="card hero">
+      : `${diff < 0 ? '▼' : '▲'} ${nf(Math.abs(diff))} ${consUnit()} ${better ? 'meglio' : 'peggio'} della media`;
+    html = dueCard + `<div class="card hero">
       <div class="label">Consumo medio</div>
-      <div class="big">${nf(s.avgCons, 2)} <small>L/100 km</small></div>
-      <div class="sub">${nf(s.kmL, 1)} km/L · ultimo pieno ${nf(s.last.cons, 2)} (${trend})</div>
+      <div class="big">${nf(consVal(s.avgCons), consDec())} <small>${consUnit()}</small></div>
+      <div class="sub">${other(s.avgCons)} · ultimo pieno ${consFmt(s.last.cons, true)} (${trend})</div>
     </div>`;
   } else {
-    html += `<div class="card hero"><div class="label">Consumo medio</div><div class="big">–</div>
+    html = dueCard + `<div class="card hero"><div class="label">Consumo medio</div><div class="big">–</div>
       <div class="sub">Servono almeno due pieni (con "Serbatoio pieno" attivo) per calcolarlo.</div></div>`;
   }
   html += `<div class="grid2">
@@ -178,8 +213,8 @@ function renderHome(el) {
     <div class="stat"><div class="k">Speso questo mese</div><div class="v">${eur(s.spentMonth, 0)}</div></div>
     <div class="stat"><div class="k">Litri totali</div><div class="v">${nf(s.totalLiters, 0)}<small> L</small></div></div>
     <div class="stat"><div class="k">Km tracciati</div><div class="v">${nf(s.kmTracked, 0)}<small> km</small></div></div>
-    ${s.best ? `<div class="stat"><div class="k">Miglior consumo</div><div class="v good">${nf(s.best.cons, 2)}</div></div>
-    <div class="stat"><div class="k">Peggior consumo</div><div class="v bad">${nf(s.worst.cons, 2)}</div></div>` : ''}
+    ${s.best ? `<div class="stat"><div class="k">Miglior consumo</div><div class="v good">${nf(consVal(s.best.cons), consDec())}<small> ${consUnit()}</small></div></div>
+    <div class="stat"><div class="k">Peggior consumo</div><div class="v bad">${nf(consVal(s.worst.cons), consDec())}<small> ${consUnit()}</small></div></div>` : ''}
   </div>`;
   if (s.costYear) {
     html += `<div class="card"><h2>Proiezione annuale</h2>
@@ -195,7 +230,7 @@ function rowHtml(r) {
     <span class="t">${fmtDate(r.date)}${r.full ? '' : '<span class="badge">parziale</span>'}</span>
     <span class="r">${eur(r.total)}</span>
     <span class="s">${nf(r.liters, 2)} L · ${eur(r.price, 3)}/L · ${nf(r.odo, 0)} km</span>
-    <span class="s" style="text-align:right">${r.cons != null ? nf(r.cons, 2) + ' L/100' : ''}</span>
+    <span class="s" style="text-align:right">${r.cons != null ? consFmt(r.cons, true) : ''}</span>
   </button>`;
 }
 
@@ -342,11 +377,12 @@ function renderCharts(el) {
   let html = '';
   const segPts = (key, dec, suffix) => rows.map((r, i) => r[key] != null ? { x: i, y: r[key], tip: `${fmtDate(r.date)} · ${nf(r[key], dec)} ${suffix}` } : null).filter(Boolean);
   if (s.segs.length) {
-    html += card('Consumo (L/100 km)', lineChart([{ name: 'Consumo', color: COLORS[0], pts: segPts('cons', 2, 'L/100 km') }], labels, { ref: s.avgCons })
-      + `<p class="muted small" style="margin:6px 0 0">Linea tratteggiata: media ${nf(s.avgCons, 2)} L/100 km</p>`);
+    const consPts = rows.map((r, i) => r.cons != null ? { x: i, y: consVal(r.cons), tip: `${fmtDate(r.date)} · ${consFmt(r.cons)}` } : null).filter(Boolean);
+    html += card(`Consumo (${consUnit()})`, lineChart([{ name: 'Consumo', color: COLORS[0], pts: consPts }], labels, { ref: consVal(s.avgCons), dec: consDec() })
+      + `<p class="muted small" style="margin:6px 0 0">Linea tratteggiata: media ${consFmt(s.avgCons)}</p>`);
     html += card('Costo al km (€)', lineChart([{ name: 'Costo/km', color: COLORS[0], pts: segPts('costKm', 3, '€/km') }], labels, { dec: 3, ref: s.costKm }));
   } else {
-    html += card('Consumo', `<p class="muted" style="margin:0">Il grafico dei consumi per pieno appare dopo almeno due pieni.${s.estimated ? ` Per ora il consumo medio stimato è ${nf(s.avgCons, 2)} L/100 km.` : ''}</p>`);
+    html += card('Consumo', `<p class="muted" style="margin:0">Il grafico dei consumi per pieno appare dopo almeno due pieni.${s.estimated ? ` Per ora il consumo medio stimato è ${consFmt(s.avgCons)}.` : ''}</p>`);
   }
   const eff = { name: 'Prezzo pagato', color: COLORS[0], pts: rows.map((r, i) => ({ x: i, y: r.price, tip: `${fmtDate(r.date)} · pagato ${eur(r.price, 3)}/L` })) };
   const pumpPts = rows.map((r, i) => r.pump ? { x: i, y: r.pump, tip: `${fmtDate(r.date)} · pompa ${eur(r.pump, 3)}/L` } : null).filter(Boolean);
@@ -369,7 +405,7 @@ document.addEventListener('click', e => {
 });
 
 /* ============ Itinerario ============ */
-const ROUTE_FACTOR = { mixed: 1, urban: 1.2, extra: 0.9, highway: 1.1 };
+const routeFactor = rt => rt === 'mixed' ? 1 : (num(db.settings.factors[rt]) > 0 ? num(db.settings.factors[rt]) : 1);
 const ROUTE_NAME = { mixed: 'Misto', urban: 'Urbano', extra: 'Extraurbano', highway: 'Autostrada' };
 
 function renderTrip(el) {
@@ -435,7 +471,7 @@ function tripUpdate() {
 
   // consumo
   let cons = NaN, note = '';
-  const f = ROUTE_FACTOR[p.rt];
+  const f = routeFactor(p.rt);
   if (p.consSrc === 'avg' || p.consSrc === 'last5') {
     cons = (p.consSrc === 'avg' ? s.avgCons : s.cons5) * f;
     note = f === 1 ? '' : `Il consumo storico è stato corretto di ×${nf(f, 2)} per il percorso "${ROUTE_NAME[p.rt]}" (stima).`;
@@ -506,10 +542,258 @@ async function routeLookup() {
   } finally { btn.disabled = false; }
 }
 
-/* ============ Veicolo e dati ============ */
-function renderVehicle(el) {
-  const v = vehicle(), c = v.cons || {};
+/* ============ Manutenzione ============ */
+// Intervalli suggeriti per la prossima scadenza: si possono sempre modificare nell'intervento
+const MAINT_TYPES = {
+  service: { name: 'Tagliando', icon: '🔧', months: 12, km: 15000 },
+  oil: { name: 'Cambio olio', icon: '🛢️', months: 12, km: 15000 },
+  tyres: { name: 'Gomme', icon: '🛞', months: 6 },
+  inspection: { name: 'Revisione', icon: '📋', months: 24 },
+  insurance: { name: 'Assicurazione', icon: '🛡️', months: 12 },
+  tax: { name: 'Bollo', icon: '🧾', months: 12 },
+  brakes: { name: 'Freni', icon: '🛑' },
+  battery: { name: 'Batteria', icon: '🔋' },
+  belt: { name: 'Distribuzione', icon: '⚙️' },
+  repair: { name: 'Riparazione', icon: '🔩' },
+  wash: { name: 'Lavaggio', icon: '🧽' },
+  other: { name: 'Altro', icon: '📌' },
+};
+const mtype = k => MAINT_TYPES[k] || MAINT_TYPES.other;
+const maintList = (vid = vehicle().id) => db.maint.filter(m => m.vid === vid);
+let maintFilter = 'all';
+
+function currentOdo(vid = vehicle().id) {
+  const odos = db.fillups.filter(f => f.vid === vid).map(f => f.odo).concat(maintList(vid).map(m => m.odo).filter(n => n > 0));
+  return odos.length ? Math.max(...odos) : null;
+}
+
+/**
+ * Scadenze aperte: per ogni tipo di intervento conta solo il più recente
+ * (rinnovare l'assicurazione chiude la scadenza precedente).
+ */
+function deadlines(vid = vehicle().id) {
+  const v = db.vehicles.find(x => x.id === vid);
+  const fills = db.fillups.filter(f => f.vid === vid);
+  const st = computeStats(enrich(fills)), kmDay = st.kmYear ? st.kmYear / 365 : null;
+  const odo = currentOdo(vid), now = today(), { warnDays, warnKm } = db.settings;
+  const latest = {};
+  maintList(vid).forEach(m => {
+    const key = m.type + (m.type === 'other' || m.type === 'repair' ? '|' + (m.title || '').trim().toLowerCase() : '');
+    const cur = latest[key];
+    if (!cur || m.date > cur.date || (m.date === cur.date && (m.odo || 0) > (cur.odo || 0))) latest[key] = m;
+  });
+  const rank = { over: 0, soon: 1, ok: 2 };
+  return Object.values(latest).filter(m => m.nextDate || m.nextKm > 0).map(m => {
+    const d = { rec: m, vehicle: v };
+    d.daysLeft = m.nextDate ? daysBetween(now, m.nextDate) : null;
+    d.kmLeft = m.nextKm > 0 && odo != null ? m.nextKm - odo : null;
+    // data stimata in cui si raggiungono i km, al ritmo di percorrenza attuale
+    d.estDate = d.kmLeft != null && kmDay ? addDays(now, Math.max(0, Math.round(d.kmLeft / kmDay))) : null;
+    const days = [d.daysLeft, d.estDate ? daysBetween(now, d.estDate) : null].filter(x => x != null);
+    d.eff = days.length ? Math.min(...days) : Infinity;
+    d.status = (d.daysLeft != null && d.daysLeft < 0) || (d.kmLeft != null && d.kmLeft <= 0) ? 'over'
+      : (d.daysLeft != null && d.daysLeft <= warnDays) || (d.kmLeft != null && d.kmLeft <= warnKm) ? 'soon' : 'ok';
+    return d;
+  }).sort((a, b) => rank[a.status] - rank[b.status] || a.eff - b.eff);
+}
+
+function dueHtml(d) {
+  const m = d.rec, t = mtype(m.type), parts = [];
+  if (m.nextDate) {
+    parts.push(d.daysLeft < 0 ? `scaduta il ${fmtDate(m.nextDate)} (${-d.daysLeft} gg fa)`
+      : d.daysLeft === 0 ? 'scade oggi' : `scade il ${fmtDate(m.nextDate)} · tra ${d.daysLeft} gg`);
+  }
+  if (m.nextKm > 0) {
+    parts.push(d.kmLeft == null ? `a ${nf(m.nextKm, 0)} km`
+      : d.kmLeft <= 0 ? `superati i ${nf(m.nextKm, 0)} km`
+      : `a ${nf(m.nextKm, 0)} km · mancano ${nf(d.kmLeft, 0)} km${d.estDate && !m.nextDate ? ` (~${fmtDate(d.estDate)})` : ''}`);
+  }
+  const label = { over: 'Scaduta', soon: 'In scadenza', ok: 'OK' }[d.status];
+  const calDate = m.nextDate || d.estDate;
+  return `<div class="due ${d.status}" data-medit="${m.id}" role="button" tabindex="0">
+    <span class="ico">${t.icon}</span>
+    <span class="t">${esc(m.title || t.name)}</span>
+    <span class="st">${label}</span>
+    <span class="s">${parts.join('<br>')}${calDate ? `<br><button class="cal" data-ics="${m.id}">📅 Aggiungi al calendario</button>` : ''}</span>
+  </div>`;
+}
+
+function renderMaint(el) {
+  const list = maintList().sort((a, b) => b.date.localeCompare(a.date) || (b.odo || 0) - (a.odo || 0));
+  if (!list.length) {
+    el.innerHTML = `<div class="card empty"><div class="ico">🔧</div><h3>Nessun intervento</h3>
+      <p class="muted">Registra tagliandi, gomme, revisione, assicurazione, bollo e riparazioni con il tasto <b>+</b>.
+      Indicando la prossima scadenza l'app ti avvisa quando si avvicina.</p>
+      <button class="btn" data-act="addm">Aggiungi intervento</button></div>`;
+    return;
+  }
+  const dl = deadlines();
+  let html = `<div class="card"><h2>Scadenze</h2>${dl.length ? `<div class="list">${dl.map(dueHtml).join('')}</div>`
+    : '<p class="muted" style="margin:0">Nessuna scadenza: aggiungila negli interventi (es. data della prossima revisione).</p>'}</div>`;
+
+  // Costi
+  const now = today(), year = now.slice(0, 4), from12 = addMonths(now, -12);
+  const total = sum(list, m => m.cost), yearCost = sum(list.filter(m => m.date.startsWith(year)), m => m.cost);
+  const m12 = sum(list.filter(m => m.date > from12), m => m.cost);
+  const fuel12 = sum(db.fillups.filter(f => f.vid === vehicle().id && f.date > from12), f => f.total);
+  html += `<div class="grid2">
+    <div class="stat"><div class="k">Manutenzione ${year}</div><div class="v">${eur(yearCost, 0)}</div></div>
+    <div class="stat"><div class="k">Manutenzione totale</div><div class="v">${eur(total, 0)}</div></div>
+    <div class="stat"><div class="k">Auto ultimi 12 mesi</div><div class="v">${eur(m12 + fuel12, 0)}</div></div>
+    <div class="stat"><div class="k">Media al mese</div><div class="v">${eur((m12 + fuel12) / 12, 0)}</div></div>
+  </div>
+  <p class="muted small" style="margin:-4px 4px 0">"Auto ultimi 12 mesi" = carburante (${eur(fuel12, 0)}) + manutenzione (${eur(m12, 0)}).</p>`;
+
+  const byType = {};
+  list.forEach(m => byType[m.type] = (byType[m.type] || 0) + m.cost);
+  const cats = Object.entries(byType).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]);
+  if (cats.length) {
+    const max = cats[0][1];
+    html += `<div class="card"><h2>Spesa per categoria</h2><div class="bars">${cats.map(([k, c]) => `
+      <div class="bar-row"><span>${mtype(k).icon} ${mtype(k).name}</span><b>${eur(c, 0)}</b>
+      <div class="track"><div class="fill" style="width:${(c / max * 100).toFixed(1)}%"></div></div></div>`).join('')}</div></div>`;
+  }
+
+  const types = [...new Set(list.map(m => m.type))];
+  if (maintFilter !== 'all' && !types.includes(maintFilter)) maintFilter = 'all';
+  const shown = maintFilter === 'all' ? list : list.filter(m => m.type === maintFilter);
+  html += `<div class="card"><h2>Interventi</h2>
+    ${types.length > 1 ? `<div class="filter"><button data-mfilter="all" class="${maintFilter === 'all' ? 'on' : ''}">Tutti</button>${types.map(k =>
+      `<button data-mfilter="${k}" class="${maintFilter === k ? 'on' : ''}">${mtype(k).icon} ${mtype(k).name}</button>`).join('')}</div>` : ''}
+    <div class="list">${shown.map(m => `<button class="row" data-medit="${m.id}">
+      <span class="t">${mtype(m.type).icon} ${esc(m.title || mtype(m.type).name)}</span>
+      <span class="r">${eur(m.cost)}</span>
+      <span class="s">${fmtDate(m.date)}${m.odo > 0 ? ` · ${nf(m.odo, 0)} km` : ''}${m.title ? ` · ${mtype(m.type).name}` : ''}</span>
+      <span class="s" style="text-align:right">${m.nextDate ? 'prossima ' + fmtDateShort(m.nextDate) : m.nextKm > 0 ? `a ${nf(m.nextKm, 0)} km` : ''}</span>
+    </button>`).join('')}</div></div>`;
+  el.innerHTML = html;
+}
+
+function maintSheet(id) {
+  const m = id ? db.maint.find(x => x.id === id) : null;
+  const v = m || { type: 'service', title: '', date: today(), odo: '', cost: '', nextDate: '', nextKm: '', note: '' };
+  const odo = currentOdo();
+  const dec = x => x === '' || x == null ? '' : String(x).replace('.', ',');
+  openSheet(`
+    <h2>${m ? 'Modifica intervento' : 'Nuovo intervento'}</h2>
+    <form id="mForm" autocomplete="off" novalidate>
+      <div class="field"><label for="mType">Tipo</label><select id="mType">${Object.entries(MAINT_TYPES).map(([k, t]) =>
+        `<option value="${k}" ${k === v.type ? 'selected' : ''}>${t.icon} ${t.name}</option>`).join('')}</select></div>
+      <div class="field"><label for="mTitle">Descrizione</label><input id="mTitle" value="${esc(v.title)}" placeholder="opzionale (es. gomme invernali, compagnia…)"></div>
+      <div class="two">
+        <div class="field"><label for="mDate">Data</label><input id="mDate" type="date" value="${v.date}"></div>
+        <div class="field"><label for="mOdo">Km veicolo</label><input id="mOdo" inputmode="numeric" value="${v.odo ?? ''}" placeholder="${odo ? nf(odo, 0) : 'opzionale'}"></div>
+      </div>
+      <div class="field"><label for="mCost">Costo €</label><input id="mCost" inputmode="decimal" value="${dec(v.cost)}" placeholder="0,00"></div>
+      <h2 style="font-size:15px;margin:16px 0 8px">Prossima scadenza</h2>
+      <div class="two">
+        <div class="field"><label for="mNextDate">Data</label><input id="mNextDate" type="date" value="${v.nextDate || ''}"></div>
+        <div class="field"><label for="mNextKm">Km</label><input id="mNextKm" inputmode="numeric" value="${v.nextKm ?? ''}" placeholder="opzionale"></div>
+      </div>
+      <div class="hint small muted" id="mHint" style="margin:-4px 0 12px"></div>
+      <div class="field"><label for="mNote">Note</label><textarea id="mNote" rows="2" placeholder="opzionale (officina, lavori fatti…)">${esc(v.note || '')}</textarea></div>
+      <div class="btns">
+        ${m ? '<button type="button" class="btn danger" id="mDel">Elimina</button>' : ''}
+        <button type="button" class="btn secondary" id="mCancel">Annulla</button>
+        <button type="submit" class="btn">Salva</button>
+      </div>
+    </form>`);
+
+  // Prossima scadenza suggerita in base al tipo, finché l'utente non la modifica
+  let nextEdited = !!m;
+  const suggest = () => {
+    const t = mtype($('#mType').value), date = $('#mDate').value, km = num($('#mOdo').value) || odo;
+    const every = [t.months && `${t.months} mesi`, t.km && `${nf(t.km, 0)} km`].filter(Boolean).join(' o ');
+    $('#mHint').textContent = every ? `Intervallo suggerito: ogni ${every}. Lascia vuoto se non c'è una scadenza.` : 'Lascia vuoto se non c\'è una scadenza.';
+    if (nextEdited) return;
+    $('#mNextDate').value = t.months && date ? addMonths(date, t.months) : '';
+    $('#mNextKm').value = t.km && km ? Math.round(km + t.km) : '';
+  };
+  ['#mType', '#mDate', '#mOdo'].forEach(s => $(s).addEventListener('input', suggest));
+  ['#mNextDate', '#mNextKm'].forEach(s => $(s).addEventListener('input', () => { nextEdited = true; }));
+  suggest();
+
+  $('#mCancel').onclick = closeSheet;
+  if (m) $('#mDel').onclick = () => {
+    if (confirm('Eliminare questo intervento?')) { db.maint = db.maint.filter(x => x.id !== m.id); save(); closeSheet(); render(); toast('Intervento eliminato'); }
+  };
+  $('#mForm').onsubmit = e => {
+    e.preventDefault();
+    const costRaw = $('#mCost').value.trim(), cost = costRaw === '' ? 0 : num(costRaw);
+    const rec = {
+      id: m ? m.id : uid(), vid: vehicle().id, type: $('#mType').value, title: $('#mTitle').value.trim(),
+      date: $('#mDate').value, odo: num($('#mOdo').value) > 0 ? num($('#mOdo').value) : null, cost,
+      nextDate: $('#mNextDate').value || '', nextKm: num($('#mNextKm').value) > 0 ? num($('#mNextKm').value) : null,
+      note: $('#mNote').value.trim(),
+    };
+    if (!rec.date) return toast('Inserisci la data');
+    if (!(cost >= 0)) return toast('Costo non valido');
+    if (rec.nextDate && rec.nextDate <= rec.date) return toast('La prossima scadenza deve essere dopo la data dell\'intervento');
+    if (m) db.maint[db.maint.findIndex(x => x.id === m.id)] = rec; else db.maint.push(rec);
+    save(); closeSheet(); render(); toast('Intervento salvato');
+  };
+}
+
+/** Evento per l'app Calendario (.ics) con promemoria 7 giorni e 1 giorno prima. */
+function addToCalendar(id) {
+  const d = deadlines().find(x => x.rec.id === id);
+  if (!d) return;
+  const m = d.rec, t = mtype(m.type), date = m.nextDate || d.estDate;
+  const icsEsc = x => String(x).replace(/[\;,]/g, c => '\\' + c).replace(/\n/g, '\\n');
+  const title = `${m.title || t.name} – ${d.vehicle.name}`;
+  const desc = [`Scadenza ${t.name}`, m.nextKm > 0 ? `oppure a ${nf(m.nextKm, 0)} km` : '', !m.nextDate ? 'Data stimata in base ai km percorsi.' : ''].filter(Boolean).join('. ');
+  const alarm = trig => ['BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(title)}`, `TRIGGER:${trig}`, 'END:VALARM'];
+  const ics = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Consumi Carburante//IT', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
+    `UID:${m.id}-${date}@consumi`, `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`,
+    `DTSTART;VALUE=DATE:${date.replace(/-/g, '')}`, `DTEND;VALUE=DATE:${addDays(date, 1).replace(/-/g, '')}`,
+    `SUMMARY:${icsEsc(title)}`, `DESCRIPTION:${icsEsc(desc)}`,
+    ...alarm('-P7D'), ...alarm('-P1D'), 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+  const name = `scadenza-${t.name.toLowerCase().replace(/\s+/g, '-')}.ics`;
+  if (isIOS()) {
+    // Su iPhone aprire direttamente il file mostra "Aggiungi al calendario"
+    location.href = 'data:text/calendar;charset=utf-8,' + encodeURIComponent(ics);
+  } else download(name, 'text/calendar', ics);
+}
+
+/* ============ Tema e badge ============ */
+function applyTheme() {
+  const th = db.settings.theme, root = document.documentElement;
+  if (th === 'auto') root.removeAttribute('data-theme'); else root.dataset.theme = th;
+  const dark = th === 'dark' || (th === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+  $$('meta[name="theme-color"]').forEach(mt => { mt.content = dark ? '#131211' : '#f6f5f3'; if (th !== 'auto') mt.removeAttribute('media'); });
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyTheme);
+
+/** Numero di scadenze (scadute o vicine) sull'icona dell'app, se il sistema lo consente. */
+function updateBadge() {
+  if (!('setAppBadge' in navigator)) return;
+  const n = sum(db.vehicles, v => deadlines(v.id).filter(d => d.status !== 'ok').length);
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+}
+
+/* ============ Impostazioni ============ */
+function renderSettings(el) {
+  const v = vehicle(), c = v.cons || {}, st = db.settings;
+  const seg = (name, cur, opts) => `<div class="seg" data-seg="${name}">${opts.map(([k, l]) => `<button type="button" data-val="${k}" class="${k === cur ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+  const badgeOk = 'setAppBadge' in navigator && 'Notification' in window;
   el.innerHTML = `
+  <div class="card"><h2>App</h2>
+    <div class="setting"><span>Tema</span>${seg('theme', st.theme, [['auto', 'Auto'], ['light', 'Chiaro'], ['dark', 'Scuro']])}</div>
+    <div class="setting"><span>Consumo</span>${seg('unit', st.unit, [['l100', 'L/100 km'], ['kml', 'km/L']])}</div>
+    <h2 style="margin-top:16px">Preavviso scadenze</h2>
+    <div class="two">
+      <div class="field"><label for="sDays">Giorni prima</label><input id="sDays" inputmode="numeric" value="${esc(st.warnDays)}"></div>
+      <div class="field"><label for="sKm">Km prima</label><input id="sKm" inputmode="numeric" value="${esc(st.warnKm)}"></div>
+    </div>
+    ${badgeOk ? `<button class="btn secondary block" id="sBadge" type="button">${Notification.permission === 'granted' ? 'Numero di scadenze sull\'icona: attivo' : 'Mostra il numero di scadenze sull\'icona'}</button>` : ''}
+    <h2 style="margin-top:16px">Correzione consumo per tipo di percorso</h2>
+    <p class="muted small" style="margin-top:0">Moltiplicatori applicati al consumo storico nell'itinerario (1 = nessuna correzione).</p>
+    <div class="two">
+      <div class="field"><label for="sfU">Urbano</label><input id="sfU" inputmode="decimal" value="${esc(String(st.factors.urban).replace('.', ','))}"></div>
+      <div class="field"><label for="sfE">Extraurbano</label><input id="sfE" inputmode="decimal" value="${esc(String(st.factors.extra).replace('.', ','))}"></div>
+    </div>
+    <div class="field"><label for="sfH">Autostrada</label><input id="sfH" inputmode="decimal" value="${esc(String(st.factors.highway).replace('.', ','))}"></div>
+  </div>
   <div class="card"><h2>Dati del veicolo</h2>
     <form id="vForm" autocomplete="off">
       <div class="field"><label for="vName">Nome</label><input id="vName" value="${esc(v.name)}"></div>
@@ -542,11 +826,31 @@ function renderVehicle(el) {
     <p class="muted small" style="margin-top:0">I dati restano solo su questo telefono. Esegui un backup ogni tanto: se cancelli i dati del browser vengono persi.</p>
     <div class="btns">
       <button class="btn secondary" id="dJson">Esporta backup</button>
-      <button class="btn secondary" id="dCsv">Esporta CSV</button>
       <button class="btn secondary" id="dImp">Importa backup</button>
     </div>
+    <div class="btns" style="margin-top:10px">
+      <button class="btn secondary" id="dCsv">CSV rifornimenti</button>
+      <button class="btn secondary" id="dCsvM">CSV manutenzione</button>
+    </div>
+    <button class="btn danger block" id="dReset" style="margin-top:10px">Cancella tutti i dati</button>
     <input type="file" id="dFile" accept="application/json,.json" hidden>
-  </div>`;
+  </div>
+  <p class="muted small" style="text-align:center">Consumi Carburante · i dati sono salvati solo su questo dispositivo</p>`;
+
+  $$('[data-seg] button').forEach(b => b.onclick = () => {
+    st[b.parentElement.dataset.seg] = b.dataset.val; save(); applyTheme(); render();
+  });
+  const bindNum = (id, set) => $(id).addEventListener('change', e => { const n = num(e.target.value); if (n >= 0) { set(n); save(); updateBadge(); } else toast('Valore non valido'); });
+  bindNum('#sDays', n => st.warnDays = Math.round(n));
+  bindNum('#sKm', n => st.warnKm = Math.round(n));
+  bindNum('#sfU', n => st.factors.urban = n);
+  bindNum('#sfE', n => st.factors.extra = n);
+  bindNum('#sfH', n => st.factors.highway = n);
+  if ($('#sBadge')) $('#sBadge').onclick = async () => {
+    const r = await Notification.requestPermission();
+    toast(r === 'granted' ? 'Badge attivo' : 'Permesso negato: puoi cambiarlo nelle impostazioni del telefono');
+    render();
+  };
 
   $('#vForm').onsubmit = e => {
     e.preventDefault();
@@ -559,12 +863,19 @@ function renderVehicle(el) {
     db.vehicles.push(n); db.active = n.id; save(); render();
   };
   if ($('#vDel')) $('#vDel').onclick = () => {
-    if (!confirm(`Eliminare "${v.name}" e tutti i suoi rifornimenti?`)) return;
+    if (!confirm(`Eliminare "${v.name}" con tutti i suoi rifornimenti e interventi?`)) return;
     db.fillups = db.fillups.filter(f => f.vid !== v.id);
+    db.maint = db.maint.filter(m => m.vid !== v.id);
     db.vehicles = db.vehicles.filter(x => x.id !== v.id); db.active = db.vehicles[0].id; save(); render();
   };
   $('#dJson').onclick = () => download(`consumi-backup-${today()}.json`, 'application/json', JSON.stringify(db, null, 1));
   $('#dCsv').onclick = exportCsv;
+  $('#dCsvM').onclick = exportMaintCsv;
+  $('#dReset').onclick = () => {
+    if (!confirm('Cancellare tutti i rifornimenti, gli interventi e i veicoli? Fai prima un backup se vuoi conservarli.')) return;
+    if (!confirm('Sei sicuro? L\'operazione non si può annullare.')) return;
+    db = defaultDb(); save(); applyTheme(); go('home'); toast('Dati cancellati');
+  };
   $('#dImp').onclick = () => $('#dFile').click();
   $('#dFile').onchange = async e => {
     const file = e.target.files[0]; if (!file) return;
@@ -572,12 +883,21 @@ function renderVehicle(el) {
       const d = JSON.parse(await file.text());
       if (!Array.isArray(d.vehicles) || !Array.isArray(d.fillups)) throw 0;
       if (!confirm('Importare il backup? Sostituirà tutti i dati attuali.')) return;
-      db = d; db.prefs ||= { trip: {} }; db.prefs.trip ||= {}; if (!db.vehicles.some(x => x.id === db.active)) db.active = db.vehicles[0].id;
-      save(); render(); toast('Backup importato');
+      if (!d.vehicles.length) throw 0;
+      db = normalize(d); save(); applyTheme(); render(); toast('Backup importato');
     } catch (err) { toast('File di backup non valido'); }
   };
 }
-function download(name, type, content) {
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+async function download(name, type, content) {
+  // Nell'app installata su iPhone i download non funzionano: si usa "Condividi" → "Salva su File"
+  if (isStandalone()) {
+    const file = new File([content], name, { type });
+    if (navigator.canShare?.({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    }
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([content], { type })); a.download = name; document.body.appendChild(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
@@ -586,7 +906,15 @@ function exportCsv() {
   const q = x => `"${String(x ?? '').replace(/"/g, '""')}"`;
   const head = ['Data', 'Km', 'Litri', 'Prezzo pompa', 'Importo', 'Prezzo effettivo', 'Pieno', 'Consumo L/100km', 'Costo/km', 'Note'];
   const lines = [head.join(';')].concat(stats().rows.map(r => [r.date, r.odo, r.liters, r.pump ?? '', r.total, round(r.price, 4), r.full ? 'sì' : 'no', r.cons != null ? round(r.cons, 3) : '', r.costKm != null ? round(r.costKm, 4) : '', q(r.note)].map(x => typeof x === 'number' ? String(x).replace('.', ',') : x).join(';')));
-  download(`rifornimenti-${today()}.csv`, 'text/csv', '﻿' + lines.join('\n'));
+  download(`rifornimenti-${today()}.csv`, 'text/csv', '\ufeff' + lines.join('\n'));
+}
+function exportMaintCsv() {
+  const q = x => `"${String(x ?? '').replace(/"/g, '""')}"`;
+  const head = ['Data', 'Tipo', 'Descrizione', 'Km', 'Costo', 'Prossima scadenza', 'Prossimi km', 'Note'];
+  const rows = maintList().sort((a, b) => a.date.localeCompare(b.date));
+  const lines = [head.join(';')].concat(rows.map(m => [m.date, q(mtype(m.type).name), q(m.title), m.odo ?? '', m.cost, m.nextDate || '', m.nextKm ?? '', q(m.note)]
+    .map(x => typeof x === 'number' ? String(x).replace('.', ',') : x).join(';')));
+  download(`manutenzione-${today()}.csv`, 'text/csv', '\ufeff' + lines.join('\n'));
 }
 
 /* ============ Eventi globali ============ */
@@ -596,19 +924,24 @@ function vehiclePicker() {
   $('#pClose').onclick = closeSheet;
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-tab],[data-edit],[data-act],[data-veh],[data-pick]');
+  const t = e.target.closest('[data-ics],[data-tab],[data-edit],[data-medit],[data-mfilter],[data-act],[data-veh],[data-pick]');
   if (!t) return;
-  if (t.dataset.tab) go(t.dataset.tab);
+  if (t.dataset.ics) addToCalendar(t.dataset.ics);
+  else if (t.dataset.tab) { closeSheet(); go(t.dataset.tab); }
+  else if (t.dataset.medit) maintSheet(t.dataset.medit);
+  else if (t.dataset.mfilter) { maintFilter = t.dataset.mfilter; render(); }
+  else if (t.dataset.act === 'addm') maintSheet();
   else if (t.dataset.edit) fillupSheet(t.dataset.edit);
   else if (t.dataset.act === 'add') fillupSheet();
   else if (t.dataset.veh) { db.active = t.dataset.veh; save(); render(); }
   else if (t.dataset.pick) { db.active = t.dataset.pick; save(); closeSheet(); render(); }
 });
-$('#fab').onclick = () => fillupSheet();
+$('#fab').onclick = () => tab === 'maint' ? maintSheet() : fillupSheet();
 $('#vehicleChip').onclick = vehiclePicker;
 $('#backdrop').onclick = closeSheet;
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
 
+applyTheme();
 render();
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
