@@ -14,7 +14,10 @@
   }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html { color-scheme: light dark; }
+html { color-scheme: light dark; background: var(--bg);
+  /* iOS (PWA installata, barra di stato trasparente): se la pagina è più corta dello schermo
+     gli elementi fissati in basso salgono di quanto è alta la barra di stato. */
+  min-height: calc(100% + env(safe-area-inset-top)); }
 body {
   margin: 0; background: var(--bg); color: var(--ink);
   font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
