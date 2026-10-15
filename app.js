@@ -28,7 +28,9 @@ function defaultDb() {
   const id = uid();
   return {
     v: 1, active: id, fillups: [],
-    vehicles: [{ id, name: 'Alfa Romeo Giulietta', year: 2010, fuel: 'Diesel', tank: 60, cons: { urban: '', mixed: '', highway: '' } }],
+    vehicles: [{ id, name: 'Alfa Romeo Giulietta 1.4 MultiAir 170 CV', year: 2010, fuel: 'Benzina', tank: 60,
+      // Valori dichiarati (ciclo NEDC); in autostrada non c'è un dato ufficiale
+      cons: { urban: '7,6', extra: '4,8', mixed: '5,8', highway: '' } }],
     prefs: { trip: {} },
   };
 }
@@ -397,6 +399,7 @@ function renderTrip(el) {
   <div class="card" id="tResult"></div>`;
 
   $('#tRoute').onclick = routeLookup;
+  $$('#tFrom, #tTo, #tKm').forEach(i => i.addEventListener('input', () => { delete db.prefs.trip.dur; }));
   $$('#view input, #view select').forEach(i => i.addEventListener('input', tripUpdate));
   tripUpdate();
 }
@@ -421,10 +424,11 @@ function tripUpdate() {
     note = f === 1 ? '' : `Il consumo storico è stato corretto di ×${nf(f, 2)} per il percorso "${ROUTE_NAME[p.rt]}" (stima).`;
   } else if (p.consSrc === 'vehicle') {
     const c = v.cons || {};
-    const key = p.rt === 'urban' ? 'urban' : p.rt === 'highway' ? 'highway' : 'mixed';
-    cons = num(c[key]);
-    if (!(cons > 0)) cons = num(c.mixed);
-    note = cons > 0 ? '' : 'Inserisci i consumi nella sezione "Veicolo".';
+    cons = num(c[p.rt]);
+    if (!(cons > 0) && num(c.mixed) > 0) {
+      cons = num(c.mixed) * f;
+      note = `Nessun consumo "${ROUTE_NAME[p.rt]}" nel veicolo: uso il misto corretto di ×${nf(f, 2)} (stima).`;
+    } else note = cons > 0 ? '' : 'Inserisci i consumi nella sezione "Veicolo".';
   } else cons = num(p.consManual);
   $('#tConsNote').textContent = note;
 
@@ -503,7 +507,10 @@ function renderVehicle(el) {
         <div class="field"><label for="vcU">Urbano</label><input id="vcU" inputmode="decimal" value="${esc(c.urban || '')}"></div>
         <div class="field"><label for="vcM">Misto</label><input id="vcM" inputmode="decimal" value="${esc(c.mixed || '')}"></div>
       </div>
-      <div class="field"><label for="vcH">Autostrada</label><input id="vcH" inputmode="decimal" value="${esc(c.highway || '')}"></div>
+      <div class="two">
+        <div class="field"><label for="vcE">Extraurbano</label><input id="vcE" inputmode="decimal" value="${esc(c.extra || '')}"></div>
+        <div class="field"><label for="vcH">Autostrada</label><input id="vcH" inputmode="decimal" value="${esc(c.highway || '')}"></div>
+      </div>
       <button class="btn block" type="submit">Salva veicolo</button>
     </form>
   </div>
@@ -527,11 +534,11 @@ function renderVehicle(el) {
   $('#vForm').onsubmit = e => {
     e.preventDefault();
     Object.assign(v, { name: $('#vName').value.trim() || 'Veicolo', year: $('#vYear').value.trim(), fuel: $('#vFuel').value.trim(), tank: $('#vTank').value.trim(),
-      cons: { urban: $('#vcU').value, mixed: $('#vcM').value, highway: $('#vcH').value } });
+      cons: { urban: $('#vcU').value, extra: $('#vcE').value, mixed: $('#vcM').value, highway: $('#vcH').value } });
     save(); render(); toast('Veicolo salvato');
   };
   $('#vAdd').onclick = () => {
-    const n = { id: uid(), name: 'Nuovo veicolo', year: '', fuel: '', tank: '', cons: { urban: '', mixed: '', highway: '' } };
+    const n = { id: uid(), name: 'Nuovo veicolo', year: '', fuel: '', tank: '', cons: { urban: '', extra: '', mixed: '', highway: '' } };
     db.vehicles.push(n); db.active = n.id; save(); render();
   };
   if ($('#vDel')) $('#vDel').onclick = () => {

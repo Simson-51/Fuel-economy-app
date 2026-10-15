@@ -1,4 +1,4 @@
-const CACHE = 'consumi-v1';
+const CACHE = 'consumi-v2';
 const ASSETS = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 
