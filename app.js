@@ -419,17 +419,21 @@ function renderTrip(el) {
   tripMap?.remove(); tripMap = null;
   el.innerHTML = `
   <div class="card"><h2>Percorso</h2>
-    <div class="field"><label for="tFrom">Partenza</label><input id="tFrom" value="${esc(p.from || '')}" placeholder="es. Torino"></div>
-    <div class="field"><label for="tTo">Destinazione</label><input id="tTo" value="${esc(p.to || '')}" placeholder="es. Roma"></div>
+    <div class="field"><label for="tFrom">Partenza</label><input id="tFrom" class="rt-in" value="${esc(p.from || '')}" placeholder="es. Torino"></div>
+    <div class="field"><label for="tTo">Destinazione</label><input id="tTo" class="rt-in" value="${esc(p.to || '')}" placeholder="es. Roma"></div>
+    <div class="field" style="margin-bottom:8px"><label>Passando da (facoltativo)</label><div id="tVia">${viaHtml(p)}</div></div>
+    <button type="button" class="btn secondary block" id="tViaAdd" style="margin-bottom:12px" ${(p.via || []).length >= 3 ? 'hidden' : ''}>+ Aggiungi tappa</button>
+    <label class="check"><input type="checkbox" id="tAvoid" class="rt-in" ${p.avoid ? 'checked' : ''}> <span>Evita i pedaggi <span class="muted small">(se il servizio lo consente)</span></span></label>
     <button class="btn secondary block" id="tRoute">Calcola percorso e tipo di strade</button>
     <div class="hint small muted" id="tRouteMsg" style="margin-top:6px">Serve la connessione internet. In alternativa inserisci i km a mano.</div>
     <div class="two" style="margin-top:12px">
-      <div class="field"><label for="tKm">Distanza (km)</label><input id="tKm" inputmode="decimal" value="${esc(p.km || '')}" placeholder="0"></div>
+      <div class="field"><label for="tKm">Distanza (km)</label><input id="tKm" class="rt-in" inputmode="decimal" value="${esc(p.km || '')}" placeholder="0"></div>
       <div class="field"><label for="tRt">Tipo di percorso</label><select id="tRt">${rtOptions(p)}</select></div>
     </div>
     <label class="check"><input type="checkbox" id="tRound" ${p.round ? 'checked' : ''}> <span>Andata e ritorno</span></label>
   </div>
   <div class="card" id="tMapCard" hidden><h2>Mappa del percorso</h2>
+    <div class="filter" id="tAlts" hidden></div>
     <div id="tMap"></div>
     <div class="legend" style="margin-top:8px">${Object.values(ROAD).map(r => `<span><i style="background:${r.color}"></i>${r.name}</span>`).join('')}</div>
   </div>
@@ -458,21 +462,40 @@ function renderTrip(el) {
   <div class="card" id="tResult"></div>`;
 
   $('#tRoute').onclick = routeLookup;
-  // Se si cambiano partenza, destinazione o km a mano, il dettaglio delle strade non vale più
-  $$('#tFrom, #tTo, #tKm').forEach(i => i.addEventListener('input', () => {
+  // Se si cambiano partenza, destinazione, tappe, pedaggi o km a mano, il dettaglio delle strade non vale più
+  const invalidate = () => {
     delete p.dur; delete p.route; lastRoute = null; tripMap?.remove(); tripMap = null; $('#tMapCard').hidden = true;
     if ($('#tRt').value === 'auto') p.rt = 'mixed';
     $('#tRt').innerHTML = rtOptions(p);
-  }));
+    tripUpdate();
+  };
+  const card = $('#tFrom').closest('.card');
+  card.addEventListener('input', e => {
+    if (e.target.dataset.via != null) p.via[+e.target.dataset.via] = e.target.value;
+    if (e.target.matches('.rt-in, [data-via]')) { if (e.target.id === 'tAvoid') p.avoid = e.target.checked; invalidate(); }
+  });
+  card.addEventListener('click', e => {
+    const del = e.target.closest('[data-viadel]'), add = e.target.closest('#tViaAdd');
+    if (!del && !add) return;
+    p.via ||= [];
+    if (del) p.via.splice(+del.dataset.viadel, 1); else p.via.push('');
+    $('#tVia').innerHTML = viaHtml(p); $('#tViaAdd').hidden = p.via.length >= 3;
+    if (add) $('#tVia').querySelector('input:last-of-type')?.focus();
+    invalidate();
+  });
+  $('#tAlts').addEventListener('click', e => { const c = e.target.closest('[data-alt]'); if (c && lastRoute) applyRoute(+c.dataset.alt); });
   $$('#view input, #view select').forEach(i => i.addEventListener('input', tripUpdate));
   tripUpdate();
   const showMap = lastRoute && lastRoute.key === routeKey(p);
+  if (showMap) renderAlts();
   if (p.route) $('#tRouteMsg').textContent = `${p.dur ? `Circa ${p.dur}. ` : ''}${roadSummary(p.route.km)}.${showMap ? '' : ' Ricalcola il percorso per rivedere la mappa.'}`;
   if (showMap) drawMap();
 }
 const rtOptions = p => [...(p.route ? [['auto', 'Auto (da mappa)']] : []), ...Object.entries(ROUTE_NAME)]
   .map(([k, n]) => `<option value="${k}" ${k === (p.rt || 'mixed') ? 'selected' : ''}>${n}</option>`).join('');
-const routeKey = p => `${(p.from || '').trim()}|${(p.to || '').trim()}`;
+const routeKey = p => `${(p.from || '').trim()}|${(p.via || []).map(x => x.trim()).filter(Boolean).join('>')}|${(p.to || '').trim()}|${p.avoid ? 'noToll' : ''}`;
+const viaHtml = p => (p.via || []).map((x, i) => `<div class="via"><input class="rt-in" data-via="${i}" value="${esc(x)}" placeholder="Tappa ${i + 1}" aria-label="Tappa ${i + 1}">
+  <button type="button" class="icon-btn" data-viadel="${i}" aria-label="Rimuovi tappa ${i + 1}">×</button></div>`).join('');
 const roadSummary = km => `${Object.entries(ROAD).map(([k, r]) => `${r.name.toLowerCase()} ${nf(km[k], 0)} km`).join(', ')}`;
 
 /** Consumo (L/100 km) per tipo di strada, secondo l'origine scelta. */
@@ -496,7 +519,7 @@ function tripUpdate() {
   Object.assign(p, {
     from: g('#tFrom'), to: g('#tTo'), km: g('#tKm'), rt: g('#tRt'), round: $('#tRound').checked,
     consSrc: g('#tConsSrc'), consManual: g('#tConsManual'), priceSrc: g('#tPriceSrc'), priceManual: g('#tPriceManual'),
-    toll: g('#tToll'), people: g('#tPeople'),
+    toll: g('#tToll'), people: g('#tPeople'), avoid: $('#tAvoid').checked,
   });
   save();
   $('#tConsManualBox').hidden = p.consSrc !== 'manual';
@@ -579,30 +602,33 @@ let lastRoute = null, tripMap = null;
  * È una stima: non distingue per esempio una strada urbana a scorrimento veloce.
  */
 function classifyRoute(route) {
-  const leg = route.legs[0], ann = leg.annotation || {}, steps = leg.steps || [];
   const rad = Math.PI / 180;
   const hav = (a, b) => {
     const dLat = (b[1] - a[1]) * rad, dLon = (b[0] - a[0]) * rad;
     return 12742 * Math.asin(Math.sqrt(Math.sin(dLat / 2) ** 2 + Math.cos(a[1] * rad) * Math.cos(b[1] * rad) * Math.sin(dLon / 2) ** 2));
   };
-  const count = sum(steps, st => Math.max(st.geometry.coordinates.length - 1, 0));
-  if (!count) throw new Error('no-steps');
-  // le annotazioni si usano solo se combaciano con i segmenti della geometria
-  const useAnn = ann.speed?.length === count && ann.distance?.length === count;
-  const segs = []; let idx = 0;
-  steps.forEach(st => {
-    const cl = new Set((st.intersections || []).flatMap(i => i.classes || [])), co = st.geometry.coordinates;
-    const stepSpeed = st.duration > 0 ? st.distance / st.duration * 3.6 : 0;
-    const secondary = /^(SS|SP|SR|SC|RA)\s?\d/i.test(st.ref || '');
-    for (let k = 0; k < co.length - 1; k++, idx++) {
-      const kmh = useAnn ? ann.speed[idx] * 3.6 : stepSpeed;
-      segs.push({
-        type: cl.has('motorway') ? 'highway' : kmh >= 50 || (secondary && kmh >= 35) ? 'extra' : 'urban',
-        km: useAnn ? ann.distance[idx] / 1000 : hav(co[k], co[k + 1]),
-        toll: cl.has('toll'), a: [co[k][1], co[k][0]], b: [co[k + 1][1], co[k + 1][0]],
-      });
-    }
+  const segs = [];
+  route.legs.forEach(leg => {                               // un "leg" per ogni tratta tra due tappe
+    const ann = leg.annotation || {}, steps = leg.steps || [];
+    const count = sum(steps, st => Math.max(st.geometry.coordinates.length - 1, 0));
+    // le annotazioni si usano solo se combaciano con i segmenti della geometria
+    const useAnn = ann.speed?.length === count && ann.distance?.length === count;
+    let idx = 0;
+    steps.forEach(st => {
+      const cl = new Set((st.intersections || []).flatMap(i => i.classes || [])), co = st.geometry.coordinates;
+      const stepSpeed = st.duration > 0 ? st.distance / st.duration * 3.6 : 0;
+      const secondary = /^(SS|SP|SR|SC|RA)\s?\d/i.test(st.ref || '');
+      for (let k = 0; k < co.length - 1; k++, idx++) {
+        const kmh = useAnn ? ann.speed[idx] * 3.6 : stepSpeed;
+        segs.push({
+          type: cl.has('motorway') ? 'highway' : kmh >= 50 || (secondary && kmh >= 35) ? 'extra' : 'urban',
+          km: useAnn ? ann.distance[idx] / 1000 : hav(co[k], co[k + 1]),
+          toll: cl.has('toll'), a: [co[k][1], co[k][0]], b: [co[k + 1][1], co[k + 1][0]],
+        });
+      }
+    });
   });
+  if (!segs.length) throw new Error('no-steps');
   const merge = list => list.reduce((runs, s) => {
     const r = runs[runs.length - 1];
     if (r && r.type === s.type) { r.km += s.km; r.coords.push(...(s.coords || [s.b])); }
@@ -641,14 +667,38 @@ async function drawMap() {
   const map = tripMap = L.map(el, { dragging: !L.Browser.mobile, scrollWheelZoom: false });
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' }).addTo(map);
   const all = [];
-  r.runs.forEach(run => { L.polyline(run.coords, { color: ROAD[run.type].color, weight: 5, opacity: .9 }).addTo(map); all.push(...run.coords); });
+  r.opts[r.sel].info.runs.forEach(run => { L.polyline(run.coords, { color: ROAD[run.type].color, weight: 5, opacity: .9 }).addTo(map); all.push(...run.coords); });
   const pin = (pt, label, color) => L.circleMarker(pt, { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 }).bindTooltip(label).addTo(map);
   pin(all[0], 'Partenza', '#1a7f4b'); pin(all[all.length - 1], 'Destinazione', '#1c1b1a');
+  (r.stops || []).forEach((pt, i) => pin(pt, `Tappa ${i + 1}`, '#6d6a66'));
   map.fitBounds(all, { padding: [24, 24] });
+}
+
+const fmtDur = sec => { const m = Math.round(sec / 60); return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`; };
+
+/** Applica al calcolo il percorso (o l'alternativa) scelto. */
+function applyRoute(i) {
+  const p = db.prefs.trip, r = lastRoute, o = r.opts[i];
+  r.sel = i;
+  const km = o.distance / 1000, k = km / sum(ROAD_KEYS, t => o.info.km[t]);
+  // I km per tipo di strada sono riportati alla distanza ufficiale del percorso
+  p.route = { km: Object.fromEntries(ROAD_KEYS.map(t => [t, o.info.km[t] * k])), tollKm: o.info.tollKm * k };
+  p.rt = 'auto'; p.dur = fmtDur(o.duration);
+  $('#tKm').value = String(round(km, 1)).replace('.', ',');
+  $('#tRt').innerHTML = rtOptions(p);
+  $('#tRouteMsg').textContent = `Percorso stradale: ${nf(km, 1)} km, circa ${p.dur}. ${roadSummary(p.route.km)}.${r.note ? ' ' + r.note : ''}`;
+  renderAlts(); tripUpdate(); drawMap();
+}
+function renderAlts() {
+  const box = $('#tAlts'), r = lastRoute;
+  if (!box || !r) return;
+  box.hidden = r.opts.length < 2;
+  box.innerHTML = r.opts.map((o, i) => `<button type="button" data-alt="${i}" class="${i === r.sel ? 'on' : ''}">${i === 0 ? 'Più veloce' : 'Alternativa ' + i} · ${nf(o.distance / 1000, 0)} km · ${fmtDur(o.duration)}${o.info.tollKm > 1 ? '' : ' · senza pedaggi'}</button>`).join('');
 }
 
 async function routeLookup() {
   const p = db.prefs.trip, msg = $('#tRouteMsg'), from = $('#tFrom').value.trim(), to = $('#tTo').value.trim();
+  const via = (p.via || []).map(x => x.trim()).filter(Boolean), avoid = $('#tAvoid').checked;
   if (!from || !to) { msg.textContent = 'Inserisci partenza e destinazione.'; return; }
   const btn = $('#tRoute'); btn.disabled = true; msg.textContent = 'Calcolo del percorso…';
   const geo = async q => {
@@ -659,27 +709,35 @@ async function routeLookup() {
     return j[0];
   };
   try {
-    const [a, b] = await Promise.all([geo(from), geo(to)]);
-    const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=false&steps=true&geometries=geojson&annotations=distance,speed`);
+    const names = [from, ...via, to], pts = [];
+    for (let i = 0; i < names.length; i++) {
+      if (i && names.length > 2) await new Promise(r => setTimeout(r, 1100));   // Nominatim: al massimo una richiesta al secondo
+      pts.push(await geo(names[i]));
+    }
+    const coords = pts.map(x => `${x.lon},${x.lat}`).join(';');
+    const base = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=false&steps=true&geometries=geojson&annotations=distance,speed`
+      + (names.length === 2 ? '&alternatives=true' : '');
+    let note = '', r = avoid ? await fetch(base + '&exclude=toll') : null;
+    if (avoid && !r.ok) { r = null; note = 'Il servizio di percorsi non permette di evitare i pedaggi: ecco il percorso standard.'; }
+    else if (avoid) note = 'Percorso senza pedaggi.';
+    r ||= await fetch(base);
     if (!r.ok) throw new Error('route');
     const j = await r.json();
     if (!j.routes?.length) throw new Error('route');
-    const km = j.routes[0].distance / 1000, mins = Math.round(j.routes[0].duration / 60);
-    let info = null;
-    try { info = classifyRoute(j.routes[0]); } catch (e) { /* senza dettaglio delle strade si usa solo la distanza */ }
-    $('#tKm').value = String(round(km, 1)).replace('.', ',');
-    p.dur = `${Math.floor(mins / 60)} h ${String(mins % 60).padStart(2, '0')} min`;
-    if (info) {
-      // I km per tipo di strada sono riportati alla distanza ufficiale del percorso
-      const k = km / sum(ROAD_KEYS, t => info.km[t]);
-      ROAD_KEYS.forEach(t => info.km[t] *= k);
-      p.route = { km: info.km, tollKm: info.tollKm * k }; p.rt = 'auto';
-      lastRoute = { key: routeKey({ from, to }), runs: info.runs };
-    } else { delete p.route; lastRoute = null; if (p.rt === 'auto') p.rt = 'mixed'; }
-    $('#tRt').innerHTML = rtOptions(p);
-    msg.textContent = `Percorso stradale: ${nf(km, 1)} km, circa ${p.dur}.` + (info ? ` ${roadSummary(p.route.km)}.` : ' Dettaglio delle strade non disponibile.');
-    tripUpdate();
-    if (info) drawMap(); else { tripMap?.remove(); tripMap = null; $('#tMapCard').hidden = true; }
+    // Percorso più veloce e alternative: si tengono solo quelle di cui si riconoscono le strade
+    const opts = [];
+    j.routes.forEach(rt => { try { opts.push({ distance: rt.distance, duration: rt.duration, info: classifyRoute(rt) }); } catch (e) { /* senza dettaglio */ } });
+    if (opts.length) {
+      lastRoute = { key: routeKey({ from, via, to, avoid }), opts, sel: 0, note, stops: pts.slice(1, -1).map(x => [+x.lat, +x.lon]) };
+      applyRoute(0);
+    } else {
+      const rt = j.routes[0];
+      $('#tKm').value = String(round(rt.distance / 1000, 1)).replace('.', ',');
+      p.dur = fmtDur(rt.duration); delete p.route; lastRoute = null; if (p.rt === 'auto') p.rt = 'mixed';
+      $('#tRt').innerHTML = rtOptions(p);
+      msg.textContent = `Percorso stradale: ${nf(rt.distance / 1000, 1)} km, circa ${p.dur}. Dettaglio delle strade non disponibile.${note ? ' ' + note : ''}`;
+      tripUpdate(); tripMap?.remove(); tripMap = null; $('#tMapCard').hidden = true;
+    }
   } catch (e) {
     msg.textContent = String(e.message).startsWith('nf:')
       ? `Località non trovata: "${e.message.slice(3)}". Prova a essere più specifico.`
