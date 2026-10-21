@@ -173,3 +173,6 @@ main { max-width: 640px; margin: 0 auto; padding: 16px; display: grid; gap: 14px
 .result .line.sub { padding: 3px 0 3px 4px; border: 0; font-size: 14px; }
 .result .line.sub b { font-size: 15px; white-space: nowrap; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+
+.via { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 8px; }
+.via .icon-btn { width: 46px; height: 46px; border-radius: 10px; font-size: 22px; line-height: 1; }

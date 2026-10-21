@@ -4,7 +4,7 @@ App web installabile per tenere sotto controllo rifornimenti, consumi e spese di
 
 - **Rifornimenti**: data, km, litri, prezzo alla pompa (opzionale), importo pagato (calcolato da litri × prezzo se vuoto), pieno/parziale.
 - **Riepilogo e grafici**: consumo medio (metodo pieno su pieno), costo al km, prezzo medio, spesa mensile, km mensili, proiezione annuale.
-- **Itinerario**: percorso con mappa (OpenStreetMap/OSRM, online) che divide i km in autostrada, extraurbana e urbana e pesa il consumo su ciascun tipo; in alternativa distanza manuale, consumo storico/veicolo/manuale, prezzo medio o manuale, pedaggi, persone.
+- **Itinerario**: percorso con mappa (OpenStreetMap/OSRM, online), tappe intermedie, alternative, opzione "evita pedaggi" e ritorno su una strada diversa con distanze proprie, che divide i km in autostrada, extraurbana e urbana e pesa il consumo su ciascun tipo; in alternativa distanza manuale, consumo storico/veicolo/manuale, prezzo medio o manuale, pedaggi, persone.
 - **Manutenzione**: tagliandi, gomme, revisione, assicurazione, bollo, riparazioni e altro con costi; scadenze per data e/o km con preavviso, promemoria nel Calendario (.ics), spesa per categoria e costo totale dell'auto.
 - **Impostazioni**: tema (auto/chiaro/scuro), unità di consumo (L/100 km o km/L), preavviso scadenze, correzioni per tipo di percorso, veicoli.
 - **Dati**: salvati in locale (localStorage), backup JSON e export CSV. Funziona offline.
