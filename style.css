@@ -165,3 +165,11 @@ main { max-width: 640px; margin: 0 auto; padding: 16px; display: grid; gap: 14px
 .setting { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
 .setting > span { font-weight: 600; font-size: 15px; }
 .setting .seg { margin: 0; flex: 0 1 230px; }
+
+/* Mappa itinerario */
+#tMap { height: 260px; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); background: var(--bg); z-index: 0; }
+.road-bar { display: flex; height: 10px; border-radius: 99px; overflow: hidden; margin: 4px 0 6px; }
+.road-bar i { display: block; height: 100%; }
+.result .line.sub { padding: 3px 0 3px 4px; border: 0; font-size: 14px; }
+.result .line.sub b { font-size: 15px; white-space: nowrap; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
