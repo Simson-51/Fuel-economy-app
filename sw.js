@@ -1,9 +1,15 @@
-const CACHE = 'consumi-v5';
-const ASSETS = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
-  'icons/icon.svg', 'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
+const CACHE = 'consumi-v6';
+// File indispensabili: se uno manca l'installazione fallisce e resta la versione precedente
+const CORE = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
+  'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
+// File facoltativi (mappa): un errore non deve bloccare l'aggiornamento dell'app
+const EXTRA = ['vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(CACHE).then(async c => {
+    await c.addAll(CORE);
+    await Promise.all(EXTRA.map(u => c.add(u).catch(() => {})));
+  }).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
