@@ -588,7 +588,7 @@ function tripUpdate() {
 
 /* ---- Classificazione delle strade del percorso ---- */
 const ROAD = {
-  highway: { name: 'Autostrada', color: '#c8102e' },
+  highway: { name: 'Autostrada/superstrada', color: '#c8102e' },
   extra: { name: 'Extraurbana', color: '#2b6cb0' },
   urban: { name: 'Urbana', color: '#e08a00' },
 };
@@ -596,10 +596,11 @@ const ROAD_KEYS = Object.keys(ROAD);
 let lastRoute = null, tripMap = null;
 
 /**
- * Divide il percorso OSRM in tratti: autostrada (classe "motorway" della mappa), extraurbana
- * o urbana. Per i restanti si usa la velocità di percorrenza del tratto, che in OSRM deriva dal
- * limite o dal tipo di strada (≈ 80% del limite): sotto 50 km/h è un centro abitato.
- * È una stima: non distingue per esempio una strada urbana a scorrimento veloce.
+ * Divide il percorso OSRM in tratti: autostrada/superstrada, extraurbana o urbana.
+ * Autostrada: classe "motorway" della mappa, riferimento A… o RA…, oppure velocità del tratto da
+ * 80 km/h (limiti da 100 in su: tangenziali, superstrade). Per gli altri tratti conta la velocità,
+ * che in OSRM deriva dal limite o dal tipo di strada (≈ 80% del limite): sotto 50 km/h è un
+ * centro abitato. È una stima, basata sui dati OpenStreetMap.
  */
 function classifyRoute(route) {
   const rad = Math.PI / 180;
@@ -617,11 +618,11 @@ function classifyRoute(route) {
     steps.forEach(st => {
       const cl = new Set((st.intersections || []).flatMap(i => i.classes || [])), co = st.geometry.coordinates;
       const stepSpeed = st.duration > 0 ? st.distance / st.duration * 3.6 : 0;
-      const secondary = /^(SS|SP|SR|SC|RA)\s?\d/i.test(st.ref || '');
+      const secondary = /^(SS|SP|SR|SC)\s?\d/i.test(st.ref || ''), motorwayRef = /^(A|RA)\s?\d/i.test(st.ref || '');
       for (let k = 0; k < co.length - 1; k++, idx++) {
         const kmh = useAnn ? ann.speed[idx] * 3.6 : stepSpeed;
         segs.push({
-          type: cl.has('motorway') ? 'highway' : kmh >= 50 || (secondary && kmh >= 35) ? 'extra' : 'urban',
+          type: cl.has('motorway') || motorwayRef || kmh >= 80 ? 'highway' : kmh >= 50 || (secondary && kmh >= 35) ? 'extra' : 'urban',
           km: useAnn ? ann.distance[idx] / 1000 : hav(co[k], co[k + 1]),
           toll: cl.has('toll'), a: [co[k][1], co[k][0]], b: [co[k + 1][1], co[k + 1][0]],
         });

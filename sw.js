@@ -1,4 +1,4 @@
-const CACHE = 'consumi-v7';
+const CACHE = 'consumi-v8';
 // File indispensabili: se uno manca l'installazione fallisce e resta la versione precedente
 const CORE = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
