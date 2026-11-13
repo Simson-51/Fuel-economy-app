@@ -35,12 +35,13 @@ const round = (n, d) => Math.round(n * 10 ** d) / 10 ** d;
 
 /* ============ Dati ============ */
 const KEY = 'fuelapp.v1';
+const MAX_VIA = 5;                                         // tappe intermedie per direzione
 
 function defaultDb() {
   const id = uid();
   return {
     v: 1, active: id, fillups: [],
-    vehicles: [{ id, name: 'Alfa Romeo Giulietta 1.4 MultiAir 170 CV', year: 2010, fuel: 'Benzina', tank: 60,
+    vehicles: [{ id, name: 'Alfa Romeo Giulietta 1.4 MultiAir 170 CV', year: 2010, fuel: 'Benzina', fuels: ['Benzina'], tank: 60,
       // Valori dichiarati (ciclo NEDC); in autostrada non c'è un dato ufficiale
       cons: { urban: '7,6', extra: '4,8', mixed: '5,8', highway: '' } }],
     maint: [], settings: defaultSettings(),
@@ -59,12 +60,13 @@ function normalize(d) {
   const cleanId = x => String(x ?? '').replace(/[^\w-]/g, '');
   const isDate = x => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x) && !isNaN(parseDate(x));
   const pos = x => (Number(x) > 0 ? Number(x) : null);
-  d.vehicles = d.vehicles.filter(obj).map(v => ({ ...v, id: cleanId(v.id), name: String(v.name || 'Veicolo'), cons: obj(v.cons) ? v.cons : {} })).filter(v => v.id);
+  d.vehicles = d.vehicles.filter(obj).map(v => ({ ...v, id: cleanId(v.id), name: String(v.name || 'Veicolo'), cons: obj(v.cons) ? v.cons : {},
+    fuels: Array.isArray(v.fuels) ? v.fuels.map(x => String(x).trim()).filter(Boolean) : undefined })).filter(v => v.id);
   if (!d.vehicles.length) throw new Error('no-vehicles');
   const vids = new Set(d.vehicles.map(v => v.id));
   d.fillups = (Array.isArray(d.fillups) ? d.fillups : []).filter(obj)
     .map(f => ({ ...f, id: cleanId(f.id) || uid(), vid: cleanId(f.vid), odo: Number(f.odo), liters: Number(f.liters), total: Number(f.total),
-      pump: pos(f.pump), full: !!f.full, note: String(f.note || '') }))
+      pump: pos(f.pump), full: !!f.full, note: String(f.note || ''), fuel: f.fuel ? String(f.fuel) : undefined }))
     .filter(f => vids.has(f.vid) && isDate(f.date) && f.odo >= 0 && f.liters > 0 && f.total > 0);
   d.maint = (Array.isArray(d.maint) ? d.maint : []).filter(obj)
     .map(m => ({ ...m, id: cleanId(m.id) || uid(), vid: cleanId(m.vid), type: /^\w+$/.test(m.type) ? m.type : 'other', title: String(m.title || ''),
@@ -81,7 +83,7 @@ function normalize(d) {
   d.prefs = obj(d.prefs) ? d.prefs : {};
   const t = d.prefs.trip = obj(d.prefs.trip) ? d.prefs.trip : {};
   const cleanDir = o => {
-    o.via = Array.isArray(o.via) ? o.via.map(x => String(x ?? '')).slice(0, 3) : [];
+    o.via = Array.isArray(o.via) ? o.via.map(x => String(x ?? '')).slice(0, MAX_VIA) : [];
     if (!(obj(o.route) && obj(o.route.km) && ['highway', 'extra', 'urban'].every(k => Number.isFinite(o.route.km[k])))) delete o.route;
     if (typeof o.dur !== 'string') delete o.dur;
   };
@@ -105,6 +107,18 @@ function save() {
 }
 const vehicle = () => db.vehicles.find(v => v.id === db.active) || db.vehicles[0];
 
+/* Carburanti: ogni veicolo ha una lista (il primo è quello principale). Un rifornimento senza
+   carburante indicato vale come quello principale, così i dati già inseriti restano validi. */
+const fuelsOf = v => (Array.isArray(v.fuels) && v.fuels.length ? v.fuels : [v.fuel || 'Carburante']);
+const fuelOf = (f, v = vehicle()) => f.fuel || fuelsOf(v)[0];
+const FUEL_COLORS = ['var(--accent)', 'var(--c2)', '#e08a00', '#1a7f4b', '#8e44ad'];
+/** Carburanti usati nei rifornimenti (prima quelli della lista del veicolo), ciascuno con il suo colore. */
+function fuelList(rows, v = vehicle()) {
+  const names = [...fuelsOf(v)];
+  rows.forEach(r => { const n = fuelOf(r, v); if (!names.includes(n)) names.push(n); });
+  return names.map((name, i) => ({ name, color: FUEL_COLORS[i % FUEL_COLORS.length] }));
+}
+
 /* Unità di consumo scelta nelle impostazioni (i calcoli restano in L/100 km) */
 const kml = () => db.settings.unit === 'kml';
 const consVal = l100 => kml() ? 100 / l100 : l100;
@@ -118,23 +132,48 @@ const consFmt = (l100, short) => `${nf(consVal(l100), consDec())} ${short && !km
  * (compresi eventuali rifornimenti parziali intermedi) divisi per i km percorsi.
  * Il primo pieno serve solo da riferimento.
  */
-function enrich(list) {
+function enrich(list, v = vehicle()) {
   const rows = list.map(f => ({ ...f }))
     .sort((a, b) => a.odo - b.odo || a.date.localeCompare(b.date));
-  let base = null, accL = 0, accCost = 0;
+  let base = null, accL = 0, accCost = 0, baseFuel = null, pure = true;
   rows.forEach((f, i) => {
+    f.fuelName = fuelOf(f, v);
     f.price = f.total / f.liters;                         // prezzo effettivo €/L
     f.discount = f.pump ? f.pump - f.price : null;        // differenza vs prezzo alla pompa
     f.kmSincePrev = i ? f.odo - rows[i - 1].odo : null;
-    if (base === null) { if (f.full) { base = f.odo; accL = 0; accCost = 0; } return; }
+    if (base === null) { if (f.full) { base = f.odo; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true; } return; }
     accL += f.liters; accCost += f.total;
     if (f.full) {
       const km = f.odo - base;
-      if (km > 0) { f.segKm = km; f.segL = accL; f.cons = accL / km * 100; f.costKm = accCost / km; f.segCost = accCost; }
-      base = f.odo; accL = 0; accCost = 0;
-    }
+      if (km > 0) {
+        f.segKm = km; f.segL = accL; f.cons = accL / km * 100; f.costKm = accCost / km; f.segCost = accCost;
+        // Il carburante bruciato nel tratto è quello del pieno iniziale (più gli eventuali parziali):
+        // il tratto vale per un carburante solo se non ne sono stati mescolati altri
+        f.segFuel = pure ? baseFuel : null;
+      }
+      base = f.odo; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true;
+    } else if (f.fuelName !== baseFuel) pure = false;
   });
   return rows;
+}
+
+/** Medie per carburante: prezzo dai rifornimenti, consumo dai tratti percorsi con quel solo carburante. */
+function fuelStats(rows, v = vehicle()) {
+  return fuelList(rows, v).map(fu => {
+    const fills = rows.filter(r => r.fuelName === fu.name), segs = rows.filter(r => r.cons != null && r.segFuel === fu.name);
+    const o = { ...fu, n: fills.length, segs: segs.length };
+    if (fills.length) {
+      o.liters = sum(fills, r => r.liters); o.spent = sum(fills, r => r.total); o.avgPrice = o.spent / o.liters;
+      o.lastPrice = fills[fills.length - 1].price;
+      const l5 = fills.slice(-5); o.avgPrice5 = sum(l5, r => r.total) / sum(l5, r => r.liters);
+    }
+    if (segs.length) {
+      o.km = sum(segs, r => r.segKm); o.avgCons = sum(segs, r => r.segL) / o.km * 100;
+      const s5 = segs.slice(-5); o.cons5 = sum(s5, r => r.segL) / sum(s5, r => r.segKm) * 100;
+      o.costKm = o.avgCons * o.avgPrice / 100;
+    }
+    return o;
+  }).filter(o => o.n);
 }
 
 function computeStats(rows) {
@@ -182,9 +221,23 @@ const stats = () => computeStats(enrich(db.fillups.filter(f => f.vid === vehicle
 /* ============ UI di base ============ */
 let tab = 'home';
 let toastTimer;
-function toast(msg) {
-  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+function toast(msg, action) {
+  const t = $('#toast');
+  t.textContent = msg;
+  if (action) {
+    const btn = document.createElement('button'); btn.textContent = action.label;
+    btn.onclick = () => { t.classList.remove('show'); action.run(); };
+    t.append(' ', btn);
+  }
+  t.classList.toggle('action', !!action); t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), action ? 7000 : 2600);
+}
+/** Elimina una voce e offre "Annulla" per qualche secondo. */
+function removeWithUndo(key, id, label) {
+  const i = db[key].findIndex(x => x.id === id); if (i < 0) return;
+  const [rec] = db[key].splice(i, 1);
+  save(); closeSheet(); render();
+  toast(label + ' eliminato', { label: 'Annulla', run: () => { db[key].splice(i, 0, rec); save(); render(); toast(label + ' ripristinato'); } });
 }
 const TITLES = { home: 'Riepilogo', log: 'Storico', charts: 'Grafici', trip: 'Itinerario', maint: 'Manutenzione', settings: 'Impostazioni' };
 
@@ -203,8 +256,12 @@ function go(t) { tab = t; render(); window.scrollTo(0, 0); }
 
 function openSheet(html) {
   const s = $('#sheet'); s.innerHTML = html; s.hidden = false; $('#backdrop').hidden = false; s.scrollTop = 0;
+  document.documentElement.classList.add('sheet-open');     // la pagina sotto non scorre mentre il modulo è aperto
 }
-function closeSheet() { $('#sheet').hidden = true; $('#backdrop').hidden = true; $('#sheet').innerHTML = ''; }
+function closeSheet() {
+  $('#sheet').hidden = true; $('#backdrop').hidden = true; $('#sheet').innerHTML = '';
+  document.documentElement.classList.remove('sheet-open');
+}
 
 const emptyState = () => `
   <div class="card empty">
@@ -213,6 +270,17 @@ const emptyState = () => `
     <p class="muted">Aggiungi il primo rifornimento con il tasto <b>+</b>. Dal secondo rifornimento vedrai una stima dei consumi, che diventa precisa con due pieni.</p>
     <button class="btn" data-act="add">Aggiungi rifornimento</button>
   </div>`;
+
+/* ============ Periodo (storico e grafici) ============ */
+let period = 'all';
+function periodBar(rows) {
+  const years = [...new Set(rows.map(r => r.date.slice(0, 4)))].sort().reverse();
+  if (period !== 'all' && period !== '12m' && !years.includes(period)) period = 'all';
+  if (years.length < 2 && !(rows.length && rows[0].date <= addMonths(today(), -12))) { period = 'all'; return ''; }
+  const b = (k, l) => `<button data-period="${k}" class="${period === k ? 'on' : ''}">${l}</button>`;
+  return `<div class="filter">${b('all', 'Tutto')}${b('12m', 'Ultimi 12 mesi')}${years.map(y => b(y, y)).join('')}</div>`;
+}
+const inPeriod = r => period === 'all' ? true : period === '12m' ? r.date > addMonths(today(), -12) : r.date.startsWith(period);
 
 /* ============ Riepilogo ============ */
 function renderHome(el) {
@@ -256,14 +324,39 @@ function renderHome(el) {
     html += `<div class="card"><h2>Proiezione annuale</h2>
       <p style="margin:0">Al ritmo attuale (~${nf(s.kmYear, 0)} km/anno) spenderai circa <b>${eur(s.costYear, 0)}</b> di carburante all'anno.</p></div>`;
   }
+  const fs = fuelStats(s.rows);
+  if (fs.length > 1) {
+    html += `<div class="card"><h2>Per carburante</h2><div class="list">${fs.map(f => `<div class="row" style="cursor:default">
+      <span class="t"><i class="dot" style="background:${f.color}"></i>${esc(f.name)}</span>
+      <span class="r">${f.avgCons ? consFmt(f.avgCons, true) : '–'}</span>
+      <span class="s">${eur(f.avgPrice, 3)}/L · ${f.n} riforniment${f.n === 1 ? 'o' : 'i'}${f.km ? ` · ${nf(f.km, 0)} km` : ''}</span>
+      <span class="s" style="text-align:right">${f.costKm ? eur(f.costKm, 3) + '/km' : ''}</span></div>`).join('')}</div>
+      <p class="muted small" style="margin:8px 0 0">Il consumo di un carburante si calcola sui tratti tra due pieni percorsi solo con quello: serve un pieno del carburante e poi un altro pieno qualsiasi.</p></div>`;
+  }
+  html += backupCard();
   const last = s.rows.slice(-3).reverse();
   html += `<div class="card"><h2>Ultimi rifornimenti</h2><div class="list">${last.map(rowHtml).join('')}</div></div>`;
   el.innerHTML = html;
 }
 
+/** Promemoria di backup: i dati stanno solo sul telefono. */
+function backupCard() {
+  const n = db.fillups.length + db.maint.length, now = today();
+  if (n < 5 || (db.lastBackup && db.lastBackup > addDays(now, -60)) || (db.backupSnooze && db.backupSnooze > addDays(now, -30))) return '';
+  return `<div class="card"><h2>Backup</h2><p style="margin:0 0 10px">${db.lastBackup ? `L'ultimo backup è del ${fmtDate(db.lastBackup)}.` : 'Non hai ancora fatto un backup.'}
+    I dati sono salvati solo su questo telefono.</p>
+    <div class="btns"><button class="btn secondary" data-act="snooze">Più tardi</button><button class="btn" data-act="backup">Esporta backup</button></div></div>`;
+}
+function exportBackup() {
+  db.lastBackup = today(); save();
+  download(`consumi-backup-${today()}.json`, 'application/json', JSON.stringify(db, null, 1));
+  if (tab === 'home') render();
+}
+
 function rowHtml(r) {
+  const fuels = fuelsOf(vehicle());
   return `<button class="row" data-edit="${r.id}">
-    <span class="t">${fmtDate(r.date)}${r.full ? '' : '<span class="badge">parziale</span>'}</span>
+    <span class="t">${fmtDate(r.date)}${r.full ? '' : '<span class="badge">parziale</span>'}${r.fuelName !== fuels[0] ? `<span class="badge alt">${esc(r.fuelName)}</span>` : ''}</span>
     <span class="r">${eur(r.total)}</span>
     <span class="s">${nf(r.liters, 2)} L · ${eur(r.price, 3)}/L · ${nf(r.odo, 0)} km</span>
     <span class="s" style="text-align:right">${r.cons != null ? consFmt(r.cons, true) : ''}</span>
@@ -274,7 +367,15 @@ function rowHtml(r) {
 function renderLog(el) {
   const s = stats();
   if (!s.n) { el.innerHTML = emptyState(); return; }
-  el.innerHTML = `<div class="list">${[...s.rows].reverse().map(rowHtml).join('')}</div>
+  const bar = periodBar(s.rows), rows = s.rows.filter(inPeriod), segs = rows.filter(r => r.cons != null);
+  const cons = segs.length ? sum(segs, r => r.segL) / sum(segs, r => r.segKm) * 100 : null;
+  const summary = period === 'all' ? '' : `<div class="card"><h2>Nel periodo</h2><div class="result">
+    <div class="line"><span>Rifornimenti</span><b>${rows.length}</b></div>
+    <div class="line"><span>Spesa</span><b>${eur(sum(rows, r => r.total))}</b></div>
+    <div class="line"><span>Litri</span><b>${nf(sum(rows, r => r.liters), 1)} L</b></div>
+    <div class="line"><span>Km percorsi</span><b>${nf(sum(rows, r => r.kmSincePrev || 0), 0)} km</b></div>
+    ${cons ? `<div class="line"><span>Consumo medio</span><b>${consFmt(cons)}</b></div>` : ''}</div></div>`;
+  el.innerHTML = `${bar}${summary}<div class="list">${[...rows].reverse().map(rowHtml).join('') || '<p class="muted" style="text-align:center">Nessun rifornimento in questo periodo.</p>'}</div>
     <p class="muted small" style="text-align:center">Tocca un rifornimento per modificarlo o eliminarlo.</p>`;
 }
 
@@ -284,6 +385,10 @@ function fillupSheet(id) {
   const f = id ? db.fillups.find(x => x.id === id) : null;
   const lastOdo = rows.length ? rows[rows.length - 1].odo : null;
   const v = f || { date: today(), odo: '', liters: '', pump: '', total: '', full: true, note: '' };
+  const veh = vehicle(), fuels = fuelsOf(veh);
+  // carburante proposto: quello del rifornimento, altrimenti l'ultimo usato
+  const curFuel = f ? fuelOf(f, veh) : rows.length ? rows[rows.length - 1].fuelName : fuels[0];
+  const fuelOpts = fuels.includes(curFuel) ? fuels : [...fuels, curFuel];
   openSheet(`
     <h2>${f ? 'Modifica rifornimento' : 'Nuovo rifornimento'}</h2>
     <form id="fForm" autocomplete="off" novalidate>
@@ -298,6 +403,7 @@ function fillupSheet(id) {
       <div class="field"><label for="fTot">Importo pagato €</label>
         <input id="fTot" inputmode="decimal" value="${v.total ? String(v.total).replace('.', ',') : ''}" placeholder="0,00">
         <div class="hint" id="fHint"></div></div>
+      ${fuelOpts.length > 1 ? `<div class="field"><label for="fFuel">Carburante</label><select id="fFuel">${fuelOpts.map(x => `<option ${x === curFuel ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>` : ''}
       <label class="check"><input id="fFull" type="checkbox" ${v.full ? 'checked' : ''}> <span>Serbatoio pieno <span class="muted small">(necessario per calcolare il consumo)</span></span></label>
       <div class="field"><label for="fNote">Note</label><input id="fNote" value="${esc(v.note || '')}" placeholder="opzionale (distributore, ecc.)"></div>
       <div class="btns">
@@ -308,25 +414,31 @@ function fillupSheet(id) {
     </form>`);
 
   const lit = $('#fLit'), pump = $('#fPump'), tot = $('#fTot'), hint = $('#fHint');
-  let totAuto = !f || !f.total || (f.pump && Math.abs(f.total - f.liters * f.pump) < 0.006);
+  // Dei tre valori (litri, prezzo alla pompa, importo) ne bastano due: il terzo si calcola.
+  // Un campo calcolato si aggiorna finché non lo scrivi a mano.
+  let totAuto = !f || !f.total || (f.pump && Math.abs(f.total - f.liters * f.pump) < 0.006), litAuto = false;
+  const dec = (x, d) => String(round(x, d)).replace('.', ',');
   const refresh = () => {
-    const L = num(lit.value), P = num(pump.value), T = num(tot.value);
-    if (totAuto && L > 0 && P > 0) tot.value = String(round(L * P, 2)).replace('.', ',');
+    const P = num(pump.value);
+    if ((litAuto || lit.value.trim() === '') && !totAuto && num(tot.value) > 0 && P > 0) { lit.value = dec(num(tot.value) / P, 2); litAuto = true; }
+    else if (litAuto && !(num(tot.value) > 0 && P > 0)) { lit.value = ''; litAuto = false; }
+    const L = num(lit.value);
+    if (totAuto && !litAuto && L > 0 && P > 0) tot.value = dec(L * P, 2);
     const T2 = num(tot.value);
     if (L > 0 && T2 > 0) {
       const eff = T2 / L;
-      hint.textContent = `Prezzo effettivo: ${eur(eff, 3)}/L` + (P > 0 && Math.abs(P - eff) >= 0.0005
+      hint.textContent = litAuto ? `Litri calcolati da importo e prezzo alla pompa.` : `Prezzo effettivo: ${eur(eff, 3)}/L` + (P > 0 && Math.abs(P - eff) >= 0.0005
         ? ` (${eff < P ? 'sconto' : 'extra'} ${eur(Math.abs(P - eff), 3)}/L rispetto alla pompa)` : '');
-    } else hint.textContent = P > 0 ? 'Inserisci i litri per calcolare l\'importo.' : 'Inserisci l\'importo pagato, oppure litri e prezzo alla pompa.';
+    } else hint.textContent = 'Bastano due valori tra litri, prezzo alla pompa e importo: il terzo si calcola.';
   };
-  lit.addEventListener('input', refresh);
+  lit.addEventListener('input', () => { litAuto = false; refresh(); });
   pump.addEventListener('input', refresh);
   tot.addEventListener('input', () => { totAuto = false; refresh(); });
   refresh();
 
   $('#fCancel').onclick = closeSheet;
   if (f) $('#fDel').onclick = () => {
-    if (confirm('Eliminare questo rifornimento?')) { db.fillups = db.fillups.filter(x => x.id !== f.id); save(); closeSheet(); render(); toast('Rifornimento eliminato'); }
+    removeWithUndo('fillups', f.id, 'Rifornimento');
   };
   $('#fForm').onsubmit = e => {
     e.preventDefault();
@@ -335,11 +447,20 @@ function fillupSheet(id) {
       odo: numInt($('#fOdo').value), liters: num(lit.value), pump: num(pump.value), total: num(tot.value),
       full: $('#fFull').checked, note: $('#fNote').value.trim(),
     };
+    // il carburante principale non viene scritto: così rinominarlo non cambia i vecchi rifornimenti
+    const fuel = $('#fFuel') ? $('#fFuel').value : curFuel;
+    if (fuel !== fuels[0]) rec.fuel = fuel;
     if (!rec.date) return toast('Inserisci la data');
     if (!(rec.odo >= 0)) return toast('Inserisci i km del veicolo');
     if (!(rec.liters > 0)) return toast('Inserisci i litri');
     if (!(rec.total > 0)) { if (rec.pump > 0) rec.total = round(rec.liters * rec.pump, 2); else return toast('Inserisci importo o prezzo alla pompa'); }
     if (!(rec.pump > 0)) rec.pump = null;
+    // Controlli di plausibilità: errori di battitura tipici
+    const ppl = rec.total / rec.liters, tank = num(veh.tank), warn = [];
+    if (ppl < 0.5 || ppl > 4) warn.push(`il prezzo risulta ${eur(ppl, 3)}/L`);
+    if (tank > 0 && rec.liters > tank * 1.05) warn.push(`${nf(rec.liters, 1)} L superano il serbatoio da ${nf(tank, 0)} L`);
+    if (rec.date > today()) warn.push('la data è nel futuro');
+    if (warn.length && !confirm(`Controlla i dati: ${warn.join('; ')}. Salvare comunque?`)) return;
     const others = rows.filter(r => !f || r.id !== f.id);
     if (others.some(r => r.odo === rec.odo) && !confirm('Esiste già un rifornimento con gli stessi km. Salvare comunque?')) return;
     const newer = others.find(r => r.odo > rec.odo && r.date < rec.date) || others.find(r => r.odo < rec.odo && r.date > rec.date);
@@ -382,7 +503,7 @@ function lineChart(series, labels, { dec = 2, ref = null, unit = '' } = {}) {
   series.forEach(s => {
     const d = s.pts.map((p, k) => `${k ? 'L' : 'M'}${X(p.x).toFixed(1)},${plot.y(p.y).toFixed(1)}`).join('');
     inner += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
-    inner += s.pts.map(p => `<circle class="dot" cx="${X(p.x).toFixed(1)}" cy="${plot.y(p.y).toFixed(1)}" r="4" fill="${s.color}" stroke="var(--card)" stroke-width="1.5" data-tip="${esc(p.tip)}"/>`).join('');
+    inner += s.pts.map(p => `<circle class="dot" cx="${X(p.x).toFixed(1)}" cy="${plot.y(p.y).toFixed(1)}" r="4" fill="${p.color || s.color}" stroke="var(--card)" stroke-width="1.5" data-tip="${esc(p.tip)}"/>`).join('');
   });
   return chartCard(chartFrame(inner, W, H, ticks, t => nf(t, dec), plot), series);
 }
@@ -401,28 +522,42 @@ function barChart(items, { dec = 0, unit = '' } = {}) {
   return chartCard(chartFrame(inner, W, H, ticks.filter(t => t >= 0), t => nf(t, dec), plot), []);
 }
 function chartCard(svg, series) {
-  const legend = series.length > 1 ? `<div class="legend">${series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join('')}</div>` : '';
+  const legend = series.length > 1 && !series.noLegend ? `<div class="legend">${series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join('')}</div>` : '';
   return `<div class="chart">${svg}${legend}<div class="tip">Tocca un punto per vedere il valore.</div></div>`;
 }
 
 function renderCharts(el) {
   const s = stats();
   if (!s.n) { el.innerHTML = emptyState(); return; }
-  const rows = s.rows, labels = rows.map(r => fmtDateShort(r.date));
+  const bar = periodBar(s.rows), rows = s.rows.filter(inPeriod), labels = rows.map(r => fmtDateShort(r.date));
+  if (!rows.length) { el.innerHTML = bar + '<div class="card"><p class="muted" style="margin:0">Nessun rifornimento in questo periodo.</p></div>'; return; }
   const card = (title, body) => `<div class="card"><h2>${title}</h2>${body}</div>`;
-  let html = '';
+  let html = bar;
+  // con più carburanti i punti prendono il colore del carburante
+  const fuels = fuelList(s.rows).filter(f => s.rows.some(r => r.fuelName === f.name)), multi = fuels.length > 1;
+  const fcol = name => fuels.find(f => f.name === name)?.color;
+  const fuelLegend = multi ? `<div class="legend">${fuels.map(f => `<span><i style="background:${f.color}"></i>${esc(f.name)}</span>`).join('')}</div>` : '';
+  const segs = rows.filter(r => r.cons != null);
   const segPts = (key, dec, suffix) => rows.map((r, i) => r[key] != null ? { x: i, y: r[key], tip: `${fmtDate(r.date)} · ${nf(r[key], dec)} ${suffix}` } : null).filter(Boolean);
-  if (s.segs.length) {
-    const consPts = rows.map((r, i) => r.cons != null ? { x: i, y: consVal(r.cons), tip: `${fmtDate(r.date)} · ${consFmt(r.cons)}` } : null).filter(Boolean);
-    html += card(`Consumo (${consUnit()})`, lineChart([{ name: 'Consumo', color: COLORS[0], pts: consPts }], labels, { ref: consVal(s.avgCons), dec: consDec() })
-      + `<p class="muted small" style="margin:6px 0 0">Linea tratteggiata: media ${consFmt(s.avgCons)}</p>`);
-    html += card('Costo al km (€)', lineChart([{ name: 'Costo/km', color: COLORS[0], pts: segPts('costKm', 3, '€/km') }], labels, { dec: 3, ref: s.costKm }));
+  if (segs.length) {
+    const avg = sum(segs, r => r.segL) / sum(segs, r => r.segKm) * 100, costKm = sum(segs, r => r.segCost) / sum(segs, r => r.segKm);
+    const consPts = rows.map((r, i) => r.cons != null ? { x: i, y: consVal(r.cons), color: multi ? (r.segFuel ? fcol(r.segFuel) : 'var(--muted)') : null,
+      tip: `${fmtDate(r.date)} · ${consFmt(r.cons)}${multi ? ` · ${r.segFuel || 'carburanti misti'}` : ''}` } : null).filter(Boolean);
+    html += card(`Consumo (${consUnit()})`, lineChart([{ name: 'Consumo', color: multi ? 'var(--muted)' : COLORS[0], pts: consPts }], labels, { ref: consVal(avg), dec: consDec() })
+      + (multi ? fuelLegend.replace('</div>', '<span><i style="background:var(--muted)"></i>misti</span></div>') : '')
+      + `<p class="muted small" style="margin:6px 0 0">Linea tratteggiata: media ${consFmt(avg)}</p>`);
+    html += card('Costo al km (€)', lineChart([{ name: 'Costo/km', color: COLORS[0], pts: segPts('costKm', 3, '€/km') }], labels, { dec: 3, ref: costKm }));
   } else {
     html += card('Consumo', `<p class="muted" style="margin:0">Il grafico dei consumi per pieno appare dopo almeno due pieni.${s.estimated ? ` Per ora il consumo medio stimato è ${consFmt(s.avgCons)}.` : ''}</p>`);
   }
-  const eff = { name: 'Prezzo pagato', color: COLORS[0], pts: rows.map((r, i) => ({ x: i, y: r.price, tip: `${fmtDate(r.date)} · pagato ${eur(r.price, 3)}/L` })) };
-  const pumpPts = rows.map((r, i) => r.pump ? { x: i, y: r.pump, tip: `${fmtDate(r.date)} · pompa ${eur(r.pump, 3)}/L` } : null).filter(Boolean);
-  html += card('Prezzo del carburante (€/L)', lineChart(pumpPts.length ? [eff, { name: 'Prezzo alla pompa', color: COLORS[1], pts: pumpPts }] : [eff], labels, { dec: 3 }));
+  if (multi) {
+    const one = [{ name: 'Prezzo pagato', color: 'var(--muted)', pts: rows.map((r, i) => ({ x: i, y: r.price, color: fcol(r.fuelName), tip: `${fmtDate(r.date)} · ${r.fuelName} · pagato ${eur(r.price, 3)}/L` })) }];
+    html += card('Prezzo del carburante (€/L)', lineChart(one, labels, { dec: 3 }) + fuelLegend);
+  } else {
+    const eff = { name: 'Prezzo pagato', color: COLORS[0], pts: rows.map((r, i) => ({ x: i, y: r.price, tip: `${fmtDate(r.date)} · pagato ${eur(r.price, 3)}/L` })) };
+    const pumpPts = rows.map((r, i) => r.pump ? { x: i, y: r.pump, tip: `${fmtDate(r.date)} · pompa ${eur(r.pump, 3)}/L` } : null).filter(Boolean);
+    html += card('Prezzo del carburante (€/L)', lineChart(pumpPts.length ? [eff, { name: 'Prezzo alla pompa', color: COLORS[1], pts: pumpPts }] : [eff], labels, { dec: 3 }));
+  }
 
   // Aggregati mensili (ultimi 12 mesi con dati)
   const months = {};
@@ -452,6 +587,7 @@ function renderTrip(el) {
   let consSrc = p.consSrc || (hasHist ? 'avg' : 'vehicle');
   if ((consSrc === 'last5' && (!hasHist || s.estimated)) || (consSrc === 'avg' && !hasHist)) consSrc = 'vehicle';
   const priceSrc = p.priceSrc || (s.n ? 'avg' : 'manual');
+  const src = tripSources(p, s);
   const sel = (val, cur, label) => `<option value="${val}" ${val === cur ? 'selected' : ''}>${label}</option>`;
   if (p.rt === 'auto' && !p.route && !ret.route) p.rt = 'mixed';
   tripMap?.remove(); tripMap = null;
@@ -460,7 +596,7 @@ function renderTrip(el) {
     <div class="field"><label for="tFrom">Partenza</label><input id="tFrom" class="rt-in" value="${esc(p.from || '')}" placeholder="es. Torino"></div>
     <div class="field"><label for="tTo">Destinazione</label><input id="tTo" class="rt-in" value="${esc(p.to || '')}" placeholder="es. Roma"></div>
     <div class="field" style="margin-bottom:8px"><label>Passando da (facoltativo)</label><div id="tVia">${viaHtml(p, 'out')}</div></div>
-    <button type="button" class="btn secondary block" id="tViaAdd" style="margin-bottom:12px" ${(p.via || []).length >= 3 ? 'hidden' : ''}>+ Aggiungi tappa</button>
+    <button type="button" class="btn secondary block" id="tViaAdd" style="margin-bottom:12px" ${(p.via || []).length >= MAX_VIA ? 'hidden' : ''}>+ Aggiungi tappa</button>
     <label class="check"><input type="checkbox" id="tAvoid" class="rt-in" ${p.avoid ? 'checked' : ''}> <span>Evita i pedaggi <span class="muted small">(se il servizio lo consente)</span></span></label>
     <button class="btn secondary block" id="tRoute">Calcola percorso e tipo di strade</button>
     <div class="hint small muted" id="tRouteMsg" style="margin-top:6px">Serve la connessione internet. In alternativa inserisci i km a mano.</div>
@@ -474,7 +610,7 @@ function renderTrip(el) {
       <label class="check"><input type="checkbox" id="tRetOn" ${ret.on ? 'checked' : ''}> <span>Il ritorno segue un'altra strada</span></label>
       <div id="tRetFields" ${p.round && ret.on ? '' : 'hidden'}>
         <div class="field" style="margin-bottom:8px"><label>Ritorno passando da (facoltativo)</label><div id="rVia">${viaHtml(ret, 'ret')}</div></div>
-        <button type="button" class="btn secondary block" id="rViaAdd" style="margin-bottom:12px" ${(ret.via || []).length >= 3 ? 'hidden' : ''}>+ Aggiungi tappa</button>
+        <button type="button" class="btn secondary block" id="rViaAdd" style="margin-bottom:12px" ${(ret.via || []).length >= MAX_VIA ? 'hidden' : ''}>+ Aggiungi tappa</button>
         <button type="button" class="btn secondary block" id="rRoute">Calcola il percorso di ritorno</button>
         <div class="hint small muted" id="rRouteMsg" style="margin-top:6px">Da destinazione a partenza. Se già conosci i km del ritorno, inseriscili qui sotto: le proporzioni tra i tipi di strada restano quelle del percorso calcolato.</div>
         <div class="field" style="margin-top:12px"><label for="rKm">Distanza ritorno (km)</label><input id="rKm" inputmode="decimal" value="${esc(ret.km || '')}" placeholder="0"></div>
@@ -487,19 +623,22 @@ function renderTrip(el) {
     <div class="filter" id="tAlts" hidden></div>
     <div id="tMap"></div>
     <div class="legend" style="margin-top:8px">${Object.values(ROAD).map(r => `<span><i style="background:${r.color}"></i>${r.name}</span>`).join('')}</div>
+    <p class="muted small" style="margin:8px 0 0">Il percorso non è quello che fai? Tocca la mappa nel punto da cui passi e scegli "Passa da qui": la strada viene ricalcolata. Tocca una tappa per toglierla.</p>
   </div>
   <div class="card"><h2>Consumo del veicolo</h2>
     <div class="field"><select id="tConsSrc" aria-label="Origine consumo">
-      ${s.estimated ? sel('avg', consSrc, `Stima dai rifornimenti (${nf(s.avgCons, 2)} L/100 km)`)
-        : hasHist ? sel('avg', consSrc, `Media storica (${nf(s.avgCons, 2)} L/100 km)`) + sel('last5', consSrc, `Ultimi 5 pieni (${nf(s.cons5, 2)} L/100 km)`) : ''}
+      ${s.estimated ? sel('avg', consSrc, `Stima dai rifornimenti (${consFmt(s.avgCons)})`)
+        : hasHist ? sel('avg', consSrc, `Media storica (${consFmt(src.cs.avgCons)})`) + sel('last5', consSrc, `Ultimi 5 pieni (${consFmt(src.cs.cons5)})`) : ''}
       ${sel('vehicle', consSrc, 'Dati inseriti nel veicolo')}${sel('manual', consSrc, 'Manuale')}
     </select></div>
-    <div class="field" id="tConsManualBox"><label for="tConsManual">Consumo (L/100 km)</label><input id="tConsManual" inputmode="decimal" value="${esc(p.consManual || '')}" placeholder="es. 6,5"></div>
+    <div class="field" id="tConsManualBox"><label for="tConsManual">Consumo (${consUnit()})</label><input id="tConsManual" inputmode="decimal" value="${esc(p.consManual || '')}" placeholder="es. ${kml() ? '15,5' : '6,5'}"></div>
     <div class="hint small muted" id="tConsNote"></div>
   </div>
   <div class="card"><h2>Prezzo del carburante</h2>
+    ${src.fuels.length > 1 ? `<div class="field"><label for="tFuel">Carburante</label><select id="tFuel">${sel('', p.fuel || '', 'Tutti (media generale)')}${src.fuels.map(f => sel(f.name, p.fuel, esc(f.name))).join('')}</select>
+      <div class="hint">Prezzo e consumo storico usano i dati di questo carburante.</div></div>` : ''}
     <div class="field"><select id="tPriceSrc" aria-label="Origine prezzo">
-      ${s.n ? sel('avg', priceSrc, `Media storica (${eur(s.avgPrice, 3)}/L)`) + sel('avg5', priceSrc, `Media ultimi 5 (${eur(s.avgPrice5, 3)}/L)`) + sel('last', priceSrc, `Ultimo rifornimento (${eur(s.lastPrice, 3)}/L)`) : ''}
+      ${s.n ? sel('avg', priceSrc, `Media storica (${eur(src.pr.avgPrice, 3)}/L)`) + sel('avg5', priceSrc, `Media ultimi 5 (${eur(src.pr.avgPrice5, 3)}/L)`) + sel('last', priceSrc, `Ultimo rifornimento (${eur(src.pr.lastPrice, 3)}/L)`) : ''}
       ${sel('manual', priceSrc, 'Manuale')}
     </select></div>
     <div class="field" id="tPriceManualBox"><label for="tPriceManual">Prezzo (€/L)</label><input id="tPriceManual" inputmode="decimal" value="${esc(p.priceManual || '')}" placeholder="es. 1,85"></div>
@@ -512,6 +651,7 @@ function renderTrip(el) {
   </div>
   <div class="card" id="tResult"></div>`;
 
+  if ($('#tFuel')) $('#tFuel').onchange = e => { p.fuel = e.target.value; save(); render(); };
   $('#tRoute').onclick = () => routeLookup('out');
   $('#rRoute').onclick = () => routeLookup('ret');
   // Cambiando partenza, destinazione, tappe o pedaggi il percorso calcolato non vale più.
@@ -528,18 +668,22 @@ function renderTrip(el) {
   const card = $('#tFrom').closest('.card');
   card.addEventListener('input', e => {
     const t = e.target;
+    if (t.matches('#tFrom, #tTo, [data-via]')) { if (t._picked) t._picked = false; else suggestFor(t); }
     if (t.dataset.via != null) { dirObj(p, t.dataset.dir).via[+t.dataset.via] = t.value; invalidate(t.dataset.dir); }
     else if (t.id === 'tFrom' || t.id === 'tTo') invalidate('both');
     else if (t.id === 'tAvoid') { p.avoid = t.checked; invalidate('both'); }
     else if (t.id === 'tRetOn' && !t.checked) invalidate('ret');
   });
+  card.addEventListener('focusout', e => { if (e.target.matches('#tFrom, #tTo, [data-via]')) setTimeout(() => { if (document.activeElement !== e.target) hideSugg(); }, 250); });
   card.addEventListener('click', e => {
+    const sg = e.target.closest('[data-sugg]');
+    if (sg) return pickSugg(+sg.dataset.sugg);
     const del = e.target.closest('[data-viadel]'), add = e.target.closest('#tViaAdd, #rViaAdd');
     if (!del && !add) return;
     const dir = del ? del.dataset.dir : add.id === 'tViaAdd' ? 'out' : 'ret', o = dirObj(p, dir), ids = DIR[dir];
     o.via ||= [];
     if (del) o.via.splice(+del.dataset.viadel, 1); else o.via.push('');
-    $(ids.via).innerHTML = viaHtml(o, dir); $(ids.add).hidden = o.via.length >= 3;
+    $(ids.via).innerHTML = viaHtml(o, dir); $(ids.add).hidden = o.via.length >= MAX_VIA;
     if (add) $(ids.via).querySelector('input:last-of-type')?.focus();
     invalidate(dir);
   });
@@ -557,12 +701,66 @@ const rtOptions = p => [...(p.route || p.ret?.route ? [['auto', 'Auto (da mappa)
   .map(([k, n]) => `<option value="${k}" ${k === (p.rt || 'mixed') ? 'selected' : ''}>${n}</option>`).join('');
 const viaHtml = (o, dir) => (o.via || []).map((x, i) => `<div class="via"><input class="rt-in" data-via="${i}" data-dir="${dir}" value="${esc(x)}" placeholder="Tappa ${i + 1}" aria-label="Tappa ${i + 1}">
   <button type="button" class="icon-btn" data-viadel="${i}" data-dir="${dir}" aria-label="Rimuovi tappa ${i + 1}">×</button></div>`).join('');
+
+/* ---- Suggerimenti di località mentre si scrive (Photon, basato su OpenStreetMap) ---- */
+const COORD = /^\s*(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*$/;   // tappa scelta sulla mappa: "lat, lon"
+let suggTimer = null, suggSeq = 0, suggItems = [], suggInput = null;
+const hideSugg = () => { clearTimeout(suggTimer); suggSeq++; const b = $('#tSugg'); if (b) b.hidden = true; };
+function placeLabel(pr) {
+  const first = pr.name || [pr.street, pr.housenumber].filter(Boolean).join(' ');
+  const parts = [first, pr.name && pr.street ? [pr.street, pr.housenumber].filter(Boolean).join(' ') : '', pr.city, pr.county, pr.countrycode && pr.countrycode !== 'IT' ? pr.country : ''];
+  return [...new Set(parts.filter(Boolean))].join(', ');
+}
+function suggestFor(input) {
+  clearTimeout(suggTimer);
+  const q = input.value.trim(), seq = ++suggSeq;
+  if (q.length < 3 || COORD.test(q)) { const b = $('#tSugg'); if (b) b.hidden = true; return; }
+  suggTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('https://photon.komoot.io/api/?limit=5&lat=42.8&lon=12.5&q=' + encodeURIComponent(q));
+      if (!r.ok) return;
+      const j = await r.json();
+      if (seq !== suggSeq || document.activeElement !== input) return;
+      const seen = new Set();
+      suggItems = (j.features || []).map(f => ({ label: placeLabel(f.properties || {}), pt: [f.geometry.coordinates[1], f.geometry.coordinates[0]] }))
+        .filter(it => it.label && !seen.has(it.label) && seen.add(it.label));
+      let box = $('#tSugg');
+      if (!box) {
+        box = document.createElement('div'); box.id = 'tSugg'; box.className = 'sugg';
+        box.addEventListener('mousedown', e => e.preventDefault());     // il campo non perde il focus prima del tocco
+      }
+      if (!suggItems.length) { box.hidden = true; return; }
+      box.innerHTML = suggItems.map((it, i) => `<button type="button" data-sugg="${i}">${esc(it.label)}</button>`).join('');
+      (input.closest('.via') || input).after(box); box.hidden = false; suggInput = input;
+    } catch (e) { /* offline o servizio non raggiungibile: si scrive a mano */ }
+  }, 350);
+}
+/** Località scelta dall'elenco: si ricordano le coordinate, così il percorso parte dal punto giusto. */
+function pickSugg(i) {
+  const it = suggItems[i], input = suggInput, p = db.prefs.trip;
+  hideSugg();
+  if (!it || !input?.isConnected) return;
+  p.geo = { ...p.geo, [it.label]: it.pt };
+  Object.keys(p.geo).slice(0, -30).forEach(k => delete p.geo[k]);
+  input.value = it.label; input._picked = true;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
 const roadSummary = km => `${Object.entries(ROAD).map(([k, r]) => `${r.name.toLowerCase()} ${nf(km[k], 0)} km`).join(', ')}`;
+
+/** Da dove prendere prezzo e consumo storico: dal carburante scelto (se ha dati) o dalla media generale. */
+function tripSources(p, s) {
+  const fuels = s.n ? fuelStats(s.rows) : [], fu = fuels.length > 1 ? fuels.find(f => f.name === p.fuel) : null;
+  return { fuels, fu, pr: fu || s, cs: fu?.avgCons ? fu : s, consFallback: !!fu && !fu.avgCons };
+}
+// il consumo manuale è scritto nell'unità scelta nelle impostazioni
+const manualCons = p => { const x = num(p.consManual); return kml() && x > 0 ? 100 / x : x; };
 
 /** Consumo (L/100 km) per tipo di strada, secondo l'origine scelta. */
 function tripConsumption(p, s, v) {
   const c = v.cons || {}, out = { mixed: NaN, highway: NaN, extra: NaN, urban: NaN }, derived = [];
-  const base = p.consSrc === 'avg' ? s.avgCons : p.consSrc === 'last5' ? s.cons5 : null;
+  const cs = tripSources(p, s).cs;
+  const base = p.consSrc === 'avg' ? cs.avgCons : p.consSrc === 'last5' ? cs.cons5 : null;
   if (base) { out.mixed = base; ROAD_KEYS.forEach(t => out[t] = base * routeFactor(t)); }
   else if (p.consSrc === 'vehicle') {
     out.mixed = num(c.mixed);
@@ -570,7 +768,7 @@ function tripConsumption(p, s, v) {
       if (num(c[t]) > 0) out[t] = num(c[t]);
       else if (out.mixed > 0) { out[t] = out.mixed * routeFactor(t); derived.push(t); }
     });
-  } else { out.mixed = num(p.consManual); ROAD_KEYS.forEach(t => out[t] = out.mixed * routeFactor(t)); }
+  } else { out.mixed = manualCons(p); ROAD_KEYS.forEach(t => out[t] = out.mixed * routeFactor(t)); }
   return { out, derived, base: !!base };
 }
 
@@ -616,20 +814,22 @@ function tripUpdate() {
   } else {
     const f = routeFactor(p.rt);
     if (base) {
-      cons = base * f;
+      cons = out.mixed * f;
       note = f === 1 ? '' : `Il consumo storico è stato corretto di ×${nf(f, 2)} per il percorso "${ROUTE_NAME[p.rt]}" (stima).`;
     } else if (p.consSrc === 'vehicle') {
       cons = p.rt === 'mixed' ? out.mixed : out[p.rt];
       if (derived.includes(p.rt)) note = `Nessun consumo "${ROUTE_NAME[p.rt]}" nel veicolo: uso il misto corretto di ×${nf(f, 2)} (stima).`;
       else if (!(cons > 0)) note = 'Inserisci i consumi nella sezione "Impostazioni".';
-    } else cons = num(p.consManual);
+    } else cons = manualCons(p);
   }
+  const src = tripSources(p, s);
+  if (src.consFallback && base) note = `Non ci sono ancora tratti percorsi solo con "${src.fu.name}": uso il consumo medio generale. ` + note;
   $('#tConsNote').textContent = note;
 
   // prezzo
   let price = NaN;
-  if (p.priceSrc === 'avg') price = s.avgPrice; else if (p.priceSrc === 'avg5') price = s.avgPrice5;
-  else if (p.priceSrc === 'last') price = s.lastPrice; else price = num(p.priceManual);
+  if (p.priceSrc === 'avg') price = src.pr.avgPrice; else if (p.priceSrc === 'avg5') price = src.pr.avgPrice5;
+  else if (p.priceSrc === 'last') price = src.pr.lastPrice; else price = num(p.priceManual);
 
   const toll = num(p.toll) || 0, people = Math.max(1, Math.floor(num(p.people)) || 1);
   const box = $('#tResult');
@@ -647,8 +847,8 @@ function tripUpdate() {
     ${p.dur ? `<div class="line"><span>Durata${p.round && !(retDiff && ret.dur) ? ' (solo andata)' : retDiff ? ' andata' : ''}</span><b>${esc(p.dur)}</b></div>` : ''}
     ${retDiff && ret.dur ? `<div class="line"><span>Durata ritorno</span><b>${esc(ret.dur)}</b></div>` : ''}
     ${parts ? `<div class="road-bar">${parts.map(x => `<i style="width:${(x.share * 100).toFixed(2)}%;background:${ROAD[x.t].color}"></i>`).join('')}</div>
-      ${parts.map(x => `<div class="line sub"><span><i class="dot" style="background:${ROAD[x.t].color}"></i>${ROAD[x.t].name} <small class="muted">${nf(x.km, 0)} km · ${nf(x.share * 100, 0)}% · ${nf(x.cons, 2)} L/100</small></span><b>${nf(x.km * x.cons / 100, 1)} L</b></div>`).join('')}` : ''}
-    <div class="line"><span>Consumo${parts ? ' medio ponderato' : ' applicato'}</span><b>${nf(cons, 2)} L/100 km</b></div>
+      ${parts.map(x => `<div class="line sub"><span><i class="dot" style="background:${ROAD[x.t].color}"></i>${ROAD[x.t].name} <small class="muted">${nf(x.km, 0)} km · ${nf(x.share * 100, 0)}% · ${consFmt(x.cons, true)}</small></span><b>${nf(x.km * x.cons / 100, 1)} L</b></div>`).join('')}` : ''}
+    <div class="line"><span>Consumo${parts ? ' medio ponderato' : ' applicato'}</span><b>${consFmt(cons)}</b></div>
     <div class="line"><span>Carburante necessario</span><b>${nf(liters, 1)} L</b></div>
     ${tank > 0 ? `<div class="line"><span>Serbatoi da ${nf(tank, 0)} L</span><b>${nf(liters / tank, 2)}</b></div>` : ''}
     <div class="line"><span>Costo carburante</span><b>${eur(fuel)}</b></div>
@@ -764,10 +964,37 @@ async function drawMap() {
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' }).addTo(map);
   const all = [];
   r.opts[r.sel].info.runs.forEach(run => { L.polyline(run.coords, { color: ROAD[run.type].color, weight: 5, opacity: .9 }).addTo(map); all.push(...run.coords); });
-  const pin = (pt, label, color) => L.circleMarker(pt, { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 }).bindTooltip(label).addTo(map);
+  const pin = (pt, label, color) => L.circleMarker(pt, { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1, bubblingMouseEvents: false }).bindTooltip(label).addTo(map);
   pin(all[0], 'Partenza', '#1a7f4b'); pin(all[all.length - 1], 'Destinazione', '#1c1b1a');
-  (r.stops || []).forEach((pt, i) => pin(pt, `Tappa ${i + 1}`, '#6d6a66'));
+  (r.stops || []).forEach((pt, i) => pin(pt, `Tappa ${i + 1}`, '#6d6a66')
+    .bindPopup(`<b>Tappa ${i + 1}</b><br><button type="button" class="btn danger" data-mapdel="${i}">Rimuovi tappa</button>`));
+  // Toccando la mappa (o il percorso) si sceglie un punto da cui far passare la strada
+  map.on('click', e => L.popup().setLatLng(e.latlng)
+    .setContent(`<button type="button" class="btn" data-mapadd="${e.latlng.lat.toFixed(5)},${e.latlng.lng.toFixed(5)}">Passa da qui</button>`).openOn(map));
   map.fitBounds(all, { padding: [24, 24] });
+}
+
+/** Tappa scelta sulla mappa: inserita tra le altre nell'ordine in cui si incontra lungo il percorso attuale. */
+function mapAddStop(lat, lon) {
+  const p = db.prefs.trip, dir = mapView, o = dirObj(p, dir), r = lastRoutes[dir];
+  if (!r) return;
+  const via = (o.via || []).filter(x => x.trim());
+  if (via.length >= MAX_VIA) return toast(`Al massimo ${MAX_VIA} tappe`);
+  const pts = r.opts[r.sel].info.runs.flatMap(x => x.coords), k = Math.cos(lat * Math.PI / 180);
+  const near = pt => pts.reduce((best, c, i) => { const d = (c[0] - pt[0]) ** 2 + ((c[1] - pt[1]) * k) ** 2; return d < best[0] ? [d, i] : best; }, [Infinity, 0])[1];
+  const at = near([lat, lon]), pos = (r.stops || []).filter(st => near(st) < at).length;
+  via.splice(pos, 0, `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+  setVia(dir, via);
+}
+function mapDelStop(i) {
+  const dir = mapView, via = (dirObj(db.prefs.trip, dir).via || []).filter(x => x.trim());
+  via.splice(i, 1); setVia(dir, via);
+}
+function setVia(dir, via) {
+  const o = dirObj(db.prefs.trip, dir), ids = DIR[dir];
+  o.via = via; save();
+  $(ids.via).innerHTML = viaHtml(o, dir); $(ids.add).hidden = via.length >= MAX_VIA;
+  routeLookup(dir);
 }
 
 const fmtDur = sec => { const m = Math.round(sec / 60); return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`; };
@@ -801,19 +1028,24 @@ async function routeLookup(dir) {
   if (!a || !b) { msg.textContent = 'Inserisci partenza e destinazione.'; return; }
   const btn = $(ids.btn); btn.disabled = true; msg.textContent = 'Calcolo del percorso…';
   const seq = ++routeSeq[dir];
+  let lookups = 0;
   const geo = async q => {
+    const c = q.match(COORD), known = p.geo?.[q];
+    if (c) return { lat: c[1], lon: c[2] };
+    if (known) return { lat: known[0], lon: known[1] };
+    if (lookups++) await new Promise(r => setTimeout(r, 1100));          // Nominatim: al massimo una richiesta al secondo
     const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=it&q=' + encodeURIComponent(q));
     if (!r.ok) throw new Error('geocode');
     const j = await r.json();
     if (!j.length) throw new Error('nf:' + q);
+    // la posizione trovata si ricorda: ricalcolando il percorso non serve cercarla di nuovo
+    p.geo = { ...p.geo, [q]: [+j[0].lat, +j[0].lon] };
+    Object.keys(p.geo).slice(0, -30).forEach(k => delete p.geo[k]);
     return j[0];
   };
   try {
     const names = [from, ...via, to], pts = [];
-    for (let i = 0; i < names.length; i++) {
-      if (i && names.length > 2) await new Promise(r => setTimeout(r, 1100));   // Nominatim: al massimo una richiesta al secondo
-      pts.push(await geo(names[i]));
-    }
+    for (const name of names) pts.push(await geo(name));
     const coords = pts.map(x => `${x.lon},${x.lat}`).join(';');
     const base = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=false&steps=true&geometries=geojson&annotations=distance,speed`
       + (names.length === 2 ? '&alternatives=true' : '');
@@ -881,7 +1113,7 @@ function currentOdo(vid = vehicle().id) {
 function deadlines(vid = vehicle().id) {
   const v = db.vehicles.find(x => x.id === vid);
   const fills = db.fillups.filter(f => f.vid === vid);
-  const st = computeStats(enrich(fills)), kmDay = st.kmYear ? st.kmYear / 365 : null;
+  const st = computeStats(enrich(fills, v)), kmDay = st.kmYear ? st.kmYear / 365 : null;
   const odo = currentOdo(vid), now = today(), { warnDays, warnKm } = db.settings;
   const latest = {};
   maintList(vid).forEach(m => {
@@ -921,7 +1153,7 @@ function dueHtml(d) {
     <span class="ico">${t.icon}</span>
     <span class="t">${esc(m.title || t.name)}</span>
     <span class="st">${label}</span>
-    <span class="s">${parts.join('<br>')}${calDate ? `<br><button class="cal" data-ics="${m.id}">📅 Aggiungi al calendario</button>` : ''}</span>
+    <span class="s">${parts.join('<br>')}<br>${calDate ? `<button class="cal" data-ics="${m.id}">📅 Calendario</button> ` : ''}<button class="cal" data-renew="${m.id}">🔁 Fatto, rinnova</button></span>
   </div>`;
 }
 
@@ -943,13 +1175,20 @@ function renderMaint(el) {
   const total = sum(list, m => m.cost), yearCost = sum(list.filter(m => m.date.startsWith(year)), m => m.cost);
   const m12 = sum(list.filter(m => m.date > from12), m => m.cost);
   const fuel12 = sum(db.fillups.filter(f => f.vid === vehicle().id && f.date > from12), f => f.total);
+  // Costo totale al km: carburante + interventi fatti da quando si registrano i rifornimenti
+  const st = stats(), firstDate = st.n ? st.rows.reduce((a, r) => (r.date < a ? r.date : a), st.rows[0].date) : null;
+  const maintKm = st.costKm && st.kmTracked > 0 ? sum(list.filter(m => m.date >= firstDate), m => m.cost) / st.kmTracked : null;
+  const totKm = maintKm != null ? st.costKm + maintKm : null;
   html += `<div class="grid2">
     <div class="stat"><div class="k">Manutenzione ${year}</div><div class="v">${eur(yearCost, 0)}</div></div>
     <div class="stat"><div class="k">Manutenzione totale</div><div class="v">${eur(total, 0)}</div></div>
     <div class="stat"><div class="k">Auto ultimi 12 mesi</div><div class="v">${eur(m12 + fuel12, 0)}</div></div>
     <div class="stat"><div class="k">Media al mese</div><div class="v">${eur((m12 + fuel12) / 12, 0)}</div></div>
+    ${totKm ? `<div class="stat"><div class="k">Costo totale al km</div><div class="v">${eur(totKm, 3)}</div></div>
+    <div class="stat"><div class="k">di cui manutenzione</div><div class="v">${eur(maintKm, 3)}</div></div>` : ''}
   </div>
-  <p class="muted small" style="margin:-4px 4px 0">"Auto ultimi 12 mesi" = carburante (${eur(fuel12, 0)}) + manutenzione (${eur(m12, 0)}).</p>`;
+  <p class="muted small" style="margin:-4px 4px 0">"Auto ultimi 12 mesi" = carburante (${eur(fuel12, 0)}) + manutenzione (${eur(m12, 0)}).${totKm
+    ? ` Il costo totale al km somma carburante e interventi (assicurazione e bollo compresi) dal primo rifornimento, su ${nf(st.kmTracked, 0)} km.` : ''}</p>`;
 
   const byType = {};
   list.forEach(m => byType[m.type] = (byType[m.type] || 0) + m.cost);
@@ -976,13 +1215,15 @@ function renderMaint(el) {
   el.innerHTML = html;
 }
 
-function maintSheet(id) {
+function maintSheet(id, renewId) {
   const m = id ? db.maint.find(x => x.id === id) : null;
-  const v = m || { type: 'service', title: '', date: today(), odo: '', cost: '', nextDate: '', nextKm: '', note: '' };
+  // Rinnovo: nuovo intervento con tipo, descrizione e costo dell'ultimo; la prossima scadenza viene riproposta
+  const old = renewId ? db.maint.find(x => x.id === renewId) : null;
+  const v = m || { type: old?.type || 'service', title: old?.title || '', date: today(), odo: '', cost: old?.cost ?? '', nextDate: '', nextKm: '', note: '' };
   const odo = currentOdo();
   const dec = x => x === '' || x == null ? '' : String(x).replace('.', ',');
   openSheet(`
-    <h2>${m ? 'Modifica intervento' : 'Nuovo intervento'}</h2>
+    <h2>${m ? 'Modifica intervento' : old ? 'Rinnova: ' + esc(old.title || mtype(old.type).name) : 'Nuovo intervento'}</h2>
     <form id="mForm" autocomplete="off" novalidate>
       <div class="field"><label for="mType">Tipo</label><select id="mType">${Object.entries(MAINT_TYPES).map(([k, t]) =>
         `<option value="${k}" ${k === v.type ? 'selected' : ''}>${t.icon} ${t.name}</option>`).join('')}</select></div>
@@ -1022,7 +1263,7 @@ function maintSheet(id) {
 
   $('#mCancel').onclick = closeSheet;
   if (m) $('#mDel').onclick = () => {
-    if (confirm('Eliminare questo intervento?')) { db.maint = db.maint.filter(x => x.id !== m.id); save(); closeSheet(); render(); toast('Intervento eliminato'); }
+    removeWithUndo('maint', m.id, 'Intervento');
   };
   $('#mForm').onsubmit = e => {
     e.preventDefault();
@@ -1106,9 +1347,10 @@ function renderSettings(el) {
       <div class="field"><label for="vName">Nome</label><input id="vName" value="${esc(v.name)}"></div>
       <div class="two">
         <div class="field"><label for="vYear">Anno</label><input id="vYear" inputmode="numeric" value="${esc(v.year || '')}"></div>
-        <div class="field"><label for="vFuel">Carburante</label><input id="vFuel" value="${esc(v.fuel || '')}" placeholder="Diesel, Benzina…"></div>
+        <div class="field"><label for="vTank">Serbatoio (L)</label><input id="vTank" inputmode="decimal" value="${esc(v.tank || '')}"></div>
       </div>
-      <div class="field"><label for="vTank">Capacità serbatoio (L)</label><input id="vTank" inputmode="decimal" value="${esc(v.tank || '')}"></div>
+      <div class="field"><label for="vFuel">Carburanti</label><input id="vFuel" value="${esc(fuelsOf(v).join(', '))}" placeholder="es. Benzina, Benzina 100 ottani">
+        <div class="hint">Separati da virgola: il primo è quello abituale. Con più carburanti puoi sceglierlo a ogni rifornimento e confrontarne consumo e costo.</div></div>
       <h2 style="margin-top:16px">Consumi dichiarati (L/100 km)</h2>
       <p class="muted small" style="margin-top:0">Usati nell'itinerario quando scegli "Dati inseriti nel veicolo" (es. dal libretto o dal computer di bordo).</p>
       <div class="two">
@@ -1161,12 +1403,14 @@ function renderSettings(el) {
 
   $('#vForm').onsubmit = e => {
     e.preventDefault();
-    Object.assign(v, { name: $('#vName').value.trim() || 'Veicolo', year: $('#vYear').value.trim(), fuel: $('#vFuel').value.trim(), tank: $('#vTank').value.trim(),
+    const fuels = [...new Set($('#vFuel').value.split(',').map(x => x.trim()).filter(Boolean))];
+    if (!fuels.length) fuels.push('Carburante');
+    Object.assign(v, { name: $('#vName').value.trim() || 'Veicolo', year: $('#vYear').value.trim(), fuel: fuels[0], fuels, tank: $('#vTank').value.trim(),
       cons: { urban: $('#vcU').value, extra: $('#vcE').value, mixed: $('#vcM').value, highway: $('#vcH').value } });
     save(); render(); toast('Veicolo salvato');
   };
   $('#vAdd').onclick = () => {
-    const n = { id: uid(), name: 'Nuovo veicolo', year: '', fuel: '', tank: '', cons: { urban: '', extra: '', mixed: '', highway: '' } };
+    const n = { id: uid(), name: 'Nuovo veicolo', year: '', fuel: '', fuels: [], tank: '', cons: { urban: '', extra: '', mixed: '', highway: '' } };
     db.vehicles.push(n); db.active = n.id; save(); render();
   };
   if ($('#vDel')) $('#vDel').onclick = () => {
@@ -1175,7 +1419,7 @@ function renderSettings(el) {
     db.maint = db.maint.filter(m => m.vid !== v.id);
     db.vehicles = db.vehicles.filter(x => x.id !== v.id); db.active = db.vehicles[0].id; save(); render();
   };
-  $('#dJson').onclick = () => download(`consumi-backup-${today()}.json`, 'application/json', JSON.stringify(db, null, 1));
+  $('#dJson').onclick = exportBackup;
   $('#dCsv').onclick = exportCsv;
   $('#dCsvM').onclick = exportMaintCsv;
   $('#dReset').onclick = () => {
@@ -1211,8 +1455,8 @@ async function download(name, type, content) {
 }
 function exportCsv() {
   const q = x => `"${String(x ?? '').replace(/"/g, '""')}"`;
-  const head = ['Data', 'Km', 'Litri', 'Prezzo pompa', 'Importo', 'Prezzo effettivo', 'Pieno', 'Consumo L/100km', 'Costo/km', 'Note'];
-  const lines = [head.join(';')].concat(stats().rows.map(r => [r.date, r.odo, r.liters, r.pump ?? '', r.total, round(r.price, 4), r.full ? 'sì' : 'no', r.cons != null ? round(r.cons, 3) : '', r.costKm != null ? round(r.costKm, 4) : '', q(r.note)].map(x => typeof x === 'number' ? String(x).replace('.', ',') : x).join(';')));
+  const head = ['Data', 'Km', 'Litri', 'Prezzo pompa', 'Importo', 'Prezzo effettivo', 'Pieno', 'Carburante', 'Consumo L/100km', 'Costo/km', 'Note'];
+  const lines = [head.join(';')].concat(stats().rows.map(r => [r.date, r.odo, r.liters, r.pump ?? '', r.total, round(r.price, 4), r.full ? 'sì' : 'no', q(r.fuelName), r.cons != null ? round(r.cons, 3) : '', r.costKm != null ? round(r.costKm, 4) : '', q(r.note)].map(x => typeof x === 'number' ? String(x).replace('.', ',') : x).join(';')));
   download(`rifornimenti-${today()}.csv`, 'text/csv', '\ufeff' + lines.join('\n'));
 }
 function exportMaintCsv() {
@@ -1231,9 +1475,15 @@ function vehiclePicker() {
   $('#pClose').onclick = closeSheet;
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-ics],[data-tab],[data-edit],[data-medit],[data-mfilter],[data-act],[data-veh],[data-pick]');
+  const t = e.target.closest('[data-mapadd],[data-mapdel],[data-renew],[data-ics],[data-period],[data-tab],[data-edit],[data-medit],[data-mfilter],[data-act],[data-veh],[data-pick]');
   if (!t) return;
-  if (t.dataset.ics) addToCalendar(t.dataset.ics);
+  if (t.dataset.mapadd) { const [la, lo] = t.dataset.mapadd.split(',').map(Number); tripMap?.closePopup(); mapAddStop(la, lo); }
+  else if (t.dataset.mapdel) { tripMap?.closePopup(); mapDelStop(+t.dataset.mapdel); }
+  else if (t.dataset.renew) maintSheet(null, t.dataset.renew);
+  else if (t.dataset.ics) addToCalendar(t.dataset.ics);
+  else if (t.dataset.period) { period = t.dataset.period; render(); }
+  else if (t.dataset.act === 'backup') exportBackup();
+  else if (t.dataset.act === 'snooze') { db.backupSnooze = today(); save(); render(); }
   else if (t.dataset.tab) { closeSheet(); go(t.dataset.tab); }
   else if (t.dataset.medit) maintSheet(t.dataset.medit);
   else if (t.dataset.mfilter) { maintFilter = t.dataset.mfilter; render(); }

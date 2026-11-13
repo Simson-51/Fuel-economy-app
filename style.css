@@ -176,3 +176,14 @@ main { max-width: 640px; margin: 0 auto; padding: 16px; display: grid; gap: 14px
 
 .via { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 8px; }
 .via .icon-btn { width: 46px; height: 46px; border-radius: 10px; font-size: 22px; line-height: 1; }
+
+html.sheet-open, html.sheet-open body { overflow: hidden; }
+.sheet { overscroll-behavior: contain; }
+.toast.action { pointer-events: auto; display: flex; align-items: center; gap: 12px; }
+.toast button { background: none; border: 0; color: #ff8f9d; font-weight: 700; padding: 4px 2px; font-size: 14px; }
+.badge.alt { background: var(--warn-soft); color: var(--warn); }
+
+.sugg { display: grid; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin: -6px 0 12px; box-shadow: var(--shadow); }
+.sugg button { text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 11px 12px; font-size: 15px; }
+.sugg button:last-child { border-bottom: 0; }
+.leaflet-popup-content .btn { min-height: 40px; padding: 8px 14px; margin-top: 4px; }
