@@ -44,7 +44,7 @@ function defaultDb() {
     vehicles: [{ id, name: 'Alfa Romeo Giulietta 1.4 MultiAir 170 CV', year: 2010, fuel: 'Benzina', fuels: ['Benzina'], tank: 60,
       // Valori dichiarati (ciclo NEDC); in autostrada non c'è un dato ufficiale
       cons: { urban: '7,6', extra: '4,8', mixed: '5,8', highway: '' } }],
-    maint: [], settings: defaultSettings(),
+    maint: [], trips: [], settings: defaultSettings(),
     prefs: { trip: {} },
   };
 }
@@ -89,6 +89,18 @@ function normalize(d) {
   };
   cleanDir(t);
   if (obj(t.ret)) cleanDir(t.ret); else delete t.ret;
+  // Itinerari salvati
+  const isMix = m => obj(m) && ['highway', 'extra', 'urban'].every(k => Number.isFinite(m[k]) && m[k] >= 0);
+  d.trips = (Array.isArray(d.trips) ? d.trips : []).filter(obj).map(x => {
+    const tr = { ...x, id: cleanId(x.id) || uid(), name: String(x.name || 'Itinerario').slice(0, 60), round: !!x.round, avoid: !!x.avoid };
+    ['from', 'to', 'km'].forEach(k => { tr[k] = String(tr[k] ?? ''); });
+    cleanDir(tr);
+    if (obj(tr.ret)) { cleanDir(tr.ret); tr.ret.km = String(tr.ret.km ?? ''); tr.ret.on = !!tr.ret.on; } else delete tr.ret;
+    tr.geo = obj(tr.geo) ? tr.geo : {};
+    if (!isMix(tr.mix)) delete tr.mix;
+    return tr;
+  });
+  if (!d.trips.some(x => x.id === t.tripId)) delete t.tripId;
   return d;
 }
 function load() {
@@ -592,6 +604,12 @@ function renderTrip(el) {
   if (p.rt === 'auto' && !p.route && !ret.route) p.rt = 'mixed';
   tripMap?.remove(); tripMap = null;
   el.innerHTML = `
+  ${db.trips.length ? `<div class="card"><h2>Itinerari salvati</h2><div class="list">${db.trips.map(tr => `
+    <div class="row trip-row${tr.id === p.tripId ? ' on' : ''}" data-tripload="${tr.id}" role="button" tabindex="0">
+      <span class="t">${esc(tr.name)}</span>
+      <button type="button" class="icon-btn" data-tripdel="${tr.id}" aria-label="Elimina ${esc(tr.name)}">×</button>
+      <span class="s">${tripDesc(tr)}</span></div>`).join('')}</div>
+    <p class="muted small" style="margin:8px 0 0">Tocca un itinerario per caricarlo.</p></div>` : ''}
   <div class="card"><h2>Percorso</h2>
     <div class="field"><label for="tFrom">Partenza</label><input id="tFrom" class="rt-in" value="${esc(p.from || '')}" placeholder="es. Torino"></div>
     <div class="field"><label for="tTo">Destinazione</label><input id="tTo" class="rt-in" value="${esc(p.to || '')}" placeholder="es. Roma"></div>
@@ -617,6 +635,7 @@ function renderTrip(el) {
         <div class="hint small muted" id="rKmNote" style="margin:-4px 0 6px"></div>
       </div>
     </div>
+    <button type="button" class="btn secondary block" id="tSave" style="margin-top:4px">Salva itinerario</button>
   </div>
   <div class="card" id="tMapCard" hidden><h2>Mappa del percorso</h2>
     <div class="seg" id="tMapSeg" hidden><button type="button" data-view="out">Andata</button><button type="button" data-view="ret">Ritorno</button></div>
@@ -654,9 +673,12 @@ function renderTrip(el) {
   if ($('#tFuel')) $('#tFuel').onchange = e => { p.fuel = e.target.value; save(); render(); };
   $('#tRoute').onclick = () => routeLookup('out');
   $('#rRoute').onclick = () => routeLookup('ret');
+  $('#tSave').onclick = () => num(p.km) > 0 ? saveTripSheet() : toast('Calcola il percorso o inserisci la distanza prima di salvare');
   // Cambiando partenza, destinazione, tappe o pedaggi il percorso calcolato non vale più.
   // Cambiando solo i km a mano, invece, restano le proporzioni tra i tipi di strada.
   const invalidate = which => {
+    delete p.tripId;                                         // non è più l'itinerario salvato così com'era
+    $$('.trip-row.on').forEach(r => r.classList.remove('on'));
     if (which !== 'ret') { delete p.dur; delete p.route; lastRoutes.out = null; routeSeq.out++; }
     if (which !== 'out') { delete ret.dur; delete ret.route; lastRoutes.ret = null; routeSeq.ret++; }
     if (!lastRoutes[mapView]) mapView = lastRoutes.out ? 'out' : lastRoutes.ret ? 'ret' : 'out';
@@ -697,6 +719,80 @@ function renderTrip(el) {
   });
   refreshMap();
 }
+/* ---- Itinerari salvati ---- */
+// Si salva il percorso (luoghi, tappe, distanze, tipi di strada); consumo e prezzo restano quelli del momento
+const TRIP_KEYS = ['from', 'to', 'via', 'avoid', 'round', 'km', 'rt', 'route', 'dur'];
+const clone = x => JSON.parse(JSON.stringify(x ?? null));
+function tripKm(t) {
+  const ret = t.ret || {}, ko = num(t.km) || t.route?.dist || 0;
+  const kr = !t.round ? 0 : ret.on ? (num(ret.km) || ret.route?.dist || 0) : ko;
+  return { ko, kr, tot: ko + kr };
+}
+/** Percentuali intere di strada (autostrada / extraurbana / urbana), andata e ritorno pesati sui rispettivi km. */
+function tripMix(t) {
+  const ret = t.ret || {}, retDiff = t.round && ret.on;
+  const norm = r => { const n = r ? sum(ROAD_KEYS, k => r.km[k]) : 0; return n > 0 ? Object.fromEntries(ROAD_KEYS.map(k => [k, r.km[k] / n])) : null; };
+  const so = norm(t.route) || norm(ret.route);
+  const { ko, kr, tot } = tripKm(t);
+  if (!so || !(tot > 0)) return null;
+  const sr = retDiff ? norm(ret.route) || so : so;
+  const raw = ROAD_KEYS.map(k => (ko * so[k] + kr * sr[k]) / tot * 100);
+  // arrotondamento con somma 100: il punto mancante va a chi ha il resto più grande
+  const pct = raw.map(Math.floor);
+  raw.map((x, i) => [x - pct[i], i]).sort((a, b) => b[0] - a[0]).slice(0, 100 - sum(pct)).forEach(([, i]) => pct[i]++);
+  return Object.fromEntries(ROAD_KEYS.map((k, i) => [k, pct[i]]));
+}
+function tripDesc(t) {
+  const { tot } = tripKm(t), m = t.mix;
+  return `${t.round ? 'A/R · ' : ''}${tot > 0 ? nf(tot, 1) + ' km' : 'distanza non indicata'}`
+    + (m ? ` · urbana ${m.urban}% · extra ${m.extra}% · autostrada ${m.highway}%` : '');
+}
+function tripSnapshot(p) {
+  const ret = dirObj(p, 'ret');
+  const snap = clone(Object.fromEntries(TRIP_KEYS.map(k => [k, p[k]])));
+  snap.ret = clone({ on: !!ret.on, km: ret.km || '', via: ret.via || [], route: ret.route, dur: ret.dur });
+  // coordinate delle località scelte dai suggerimenti o già cercate: il ricalcolo parte dagli stessi punti
+  const names = [p.from, p.to, ...(p.via || []), ...(ret.via || [])].map(x => (x || '').trim());
+  snap.geo = Object.fromEntries(names.filter(n => p.geo?.[n]).map(n => [n, p.geo[n]]));
+  const mix = tripMix(snap);
+  if (mix) snap.mix = mix;
+  return snap;
+}
+function saveTripSheet() {
+  const p = db.prefs.trip, cur = db.trips.find(x => x.id === p.tripId);
+  const def = cur?.name || [p.from, p.to].map(x => (x || '').split(',')[0].trim()).filter(Boolean).join(' – ');
+  const snap = tripSnapshot(p);
+  openSheet(`<h2>Salva itinerario</h2>
+    <form id="tsForm" autocomplete="off" novalidate>
+      <div class="field"><label for="tsName">Nome</label><input id="tsName" maxlength="60" value="${esc(def)}" placeholder="es. Casa – Lavoro"></div>
+      <p class="muted small" style="margin-top:0">${tripDesc(snap)}.<br>Si salvano partenza, destinazione, tappe, andata e ritorno, distanze e tipi di strada.
+        Con lo stesso nome di un itinerario esistente, lo aggiorni.${snap.mix ? '' : '<br>Calcola il percorso per salvare anche i tipi di strada.'}</p>
+      <div class="btns"><button type="button" class="btn secondary" id="tsCancel">Annulla</button><button type="submit" class="btn">Salva</button></div>
+    </form>`);
+  $('#tsCancel').onclick = closeSheet;
+  $('#tsForm').onsubmit = e => {
+    e.preventDefault();
+    const name = $('#tsName').value.trim();
+    if (!name) return toast('Dai un nome all\'itinerario');
+    const same = db.trips.find(x => x.name.toLowerCase() === name.toLowerCase());
+    const rec = { ...snap, id: same ? same.id : uid(), name };
+    if (same) db.trips[db.trips.indexOf(same)] = rec; else db.trips.push(rec);
+    p.tripId = rec.id; save(); closeSheet(); render();
+    toast(same ? 'Itinerario aggiornato' : 'Itinerario salvato');
+  };
+}
+function loadTrip(id) {
+  const t = db.trips.find(x => x.id === id), p = db.prefs.trip;
+  if (!t) return;
+  const c = clone(t);
+  TRIP_KEYS.forEach(k => { if (c[k] === undefined) delete p[k]; else p[k] = c[k]; });
+  p.ret = { on: false, km: '', via: [], ...c.ret };
+  p.geo = { ...p.geo, ...c.geo };
+  p.tripId = t.id;
+  resetTripState(); hideSugg(); save(); render(); window.scrollTo(0, 0);
+  toast(`Caricato "${t.name}"`);
+}
+
 const rtOptions = p => [...(p.route || p.ret?.route ? [['auto', 'Auto (da mappa)']] : []), ...Object.entries(ROUTE_NAME)]
   .map(([k, n]) => `<option value="${k}" ${k === (p.rt || 'mixed') ? 'selected' : ''}>${n}</option>`).join('');
 const viaHtml = (o, dir) => (o.via || []).map((x, i) => `<div class="via"><input class="rt-in" data-via="${i}" data-dir="${dir}" value="${esc(x)}" placeholder="Tappa ${i + 1}" aria-label="Tappa ${i + 1}">
@@ -1000,14 +1096,15 @@ function setVia(dir, via) {
 const fmtDur = sec => { const m = Math.round(sec / 60); return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`; };
 
 /** Applica al calcolo il percorso (o l'alternativa) scelto per l'andata o il ritorno. */
-function applyRoute(dir, i) {
+function applyRoute(dir, i, keepKm = null) {
   const p = db.prefs.trip, o = dirObj(p, dir), r = lastRoutes[dir], opt = r.opts[i], ids = DIR[dir];
   r.sel = i;
   const km = opt.distance / 1000, k = km / sum(ROAD_KEYS, t => opt.info.km[t]);
   // I km per tipo di strada sono riportati alla distanza ufficiale del percorso
   o.route = { km: Object.fromEntries(ROAD_KEYS.map(t => [t, opt.info.km[t] * k])), tollKm: opt.info.tollKm * k, dist: km };
   o.dur = fmtDur(opt.duration); p.rt = 'auto'; mapView = dir;
-  $(ids.km).value = String(round(km, 1)).replace('.', ',');
+  // una distanza scritta a mano (i km reali) resta: del percorso si usano solo le proporzioni
+  $(ids.km).value = keepKm ?? String(round(km, 1)).replace('.', ',');
   $('#tRt').innerHTML = rtOptions(p);
   $(ids.msg).textContent = `Percorso stradale: ${nf(km, 1)} km, circa ${o.dur}. ${roadSummary(o.route.km)}.${r.note ? ' ' + r.note : ''}`;
   tripUpdate(); refreshMap();
@@ -1063,7 +1160,9 @@ async function routeLookup(dir) {
     j.routes.forEach(rt => { try { opts.push({ distance: rt.distance, duration: rt.duration, info: classifyRoute(rt) }); } catch (e) { /* senza dettaglio */ } });
     if (opts.length) {
       lastRoutes[dir] = { opts, sel: 0, note, stops: pts.slice(1, -1).map(x => [+x.lat, +x.lon]) };
-      applyRoute(dir, 0);
+      // ricalcolo dello stesso percorso (es. per rivedere la mappa): si tiene la distanza scritta a mano
+      const typed = $(ids.km).value, keep = o.route && num(typed) > 0 && Math.abs(num(typed) - o.route.dist) > 0.05 ? typed : null;
+      applyRoute(dir, 0, keep);
     } else {
       const rt = j.routes[0];
       $(ids.km).value = String(round(rt.distance / 1000, 1)).replace('.', ',');
@@ -1475,9 +1574,11 @@ function vehiclePicker() {
   $('#pClose').onclick = closeSheet;
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-mapadd],[data-mapdel],[data-renew],[data-ics],[data-period],[data-tab],[data-edit],[data-medit],[data-mfilter],[data-act],[data-veh],[data-pick]');
+  const t = e.target.closest('[data-tripdel],[data-tripload],[data-mapadd],[data-mapdel],[data-renew],[data-ics],[data-period],[data-tab],[data-edit],[data-medit],[data-mfilter],[data-act],[data-veh],[data-pick]');
   if (!t) return;
-  if (t.dataset.mapadd) { const [la, lo] = t.dataset.mapadd.split(',').map(Number); tripMap?.closePopup(); mapAddStop(la, lo); }
+  if (t.dataset.tripdel) removeWithUndo('trips', t.dataset.tripdel, 'Itinerario');
+  else if (t.dataset.tripload) loadTrip(t.dataset.tripload);
+  else if (t.dataset.mapadd) { const [la, lo] = t.dataset.mapadd.split(',').map(Number); tripMap?.closePopup(); mapAddStop(la, lo); }
   else if (t.dataset.mapdel) { tripMap?.closePopup(); mapDelStop(+t.dataset.mapdel); }
   else if (t.dataset.renew) maintSheet(null, t.dataset.renew);
   else if (t.dataset.ics) addToCalendar(t.dataset.ics);
