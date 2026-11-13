@@ -60,13 +60,23 @@ function normalize(d) {
   const cleanId = x => String(x ?? '').replace(/[^\w-]/g, '');
   const isDate = x => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x) && !isNaN(parseDate(x));
   const pos = x => (Number(x) > 0 ? Number(x) : null);
+  const isMixOk = m => obj(m) && ['highway', 'extra', 'urban'].every(k => Number.isFinite(m[k]) && m[k] >= 0) && Math.abs(m.highway + m.extra + m.urban - 100) < 1.5;
+  // strade di un ciclo da pieno a pieno: itinerari (snapshot) × volte, più gli altri km con le loro percentuali
+  const cleanCycle = c => {
+    if (!obj(c) || !isMixOk(c.other)) return undefined;
+    const parts = (Array.isArray(c.parts) ? c.parts : []).filter(obj)
+      .map(x => ({ tripId: cleanId(x.tripId), name: String(x.name || ''), km: Number(x.km), n: Number(x.n), mix: x.mix }))
+      .filter(x => x.km > 0 && x.n > 0 && isMixOk(x.mix));
+    return { parts, other: { urban: +c.other.urban, extra: +c.other.extra, highway: +c.other.highway } };
+  };
   d.vehicles = d.vehicles.filter(obj).map(v => ({ ...v, id: cleanId(v.id), name: String(v.name || 'Veicolo'), cons: obj(v.cons) ? v.cons : {},
-    fuels: Array.isArray(v.fuels) ? v.fuels.map(x => String(x).trim()).filter(Boolean) : undefined })).filter(v => v.id);
+    fuels: Array.isArray(v.fuels) ? v.fuels.map(x => String(x).trim()).filter(Boolean) : undefined,
+    learnSpeed: ['slow', 'normal', 'fast'].includes(v.learnSpeed) ? v.learnSpeed : 'normal' })).filter(v => v.id);
   if (!d.vehicles.length) throw new Error('no-vehicles');
   const vids = new Set(d.vehicles.map(v => v.id));
   d.fillups = (Array.isArray(d.fillups) ? d.fillups : []).filter(obj)
     .map(f => ({ ...f, id: cleanId(f.id) || uid(), vid: cleanId(f.vid), odo: Number(f.odo), liters: Number(f.liters), total: Number(f.total),
-      pump: pos(f.pump), full: !!f.full, note: String(f.note || ''), fuel: f.fuel ? String(f.fuel) : undefined }))
+      pump: pos(f.pump), full: !!f.full, note: String(f.note || ''), fuel: f.fuel ? String(f.fuel) : undefined, cycle: cleanCycle(f.cycle) }))
     .filter(f => vids.has(f.vid) && isDate(f.date) && f.odo >= 0 && f.liters > 0 && f.total > 0);
   d.maint = (Array.isArray(d.maint) ? d.maint : []).filter(obj)
     .map(m => ({ ...m, id: cleanId(m.id) || uid(), vid: cleanId(m.vid), type: /^\w+$/.test(m.type) ? m.type : 'other', title: String(m.title || ''),
@@ -147,13 +157,13 @@ const consFmt = (l100, short) => `${nf(consVal(l100), consDec())} ${short && !km
 function enrich(list, v = vehicle()) {
   const rows = list.map(f => ({ ...f }))
     .sort((a, b) => a.odo - b.odo || a.date.localeCompare(b.date));
-  let base = null, accL = 0, accCost = 0, baseFuel = null, pure = true;
+  let base = null, baseDate = null, accL = 0, accCost = 0, baseFuel = null, pure = true;
   rows.forEach((f, i) => {
     f.fuelName = fuelOf(f, v);
     f.price = f.total / f.liters;                         // prezzo effettivo €/L
     f.discount = f.pump ? f.pump - f.price : null;        // differenza vs prezzo alla pompa
     f.kmSincePrev = i ? f.odo - rows[i - 1].odo : null;
-    if (base === null) { if (f.full) { base = f.odo; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true; } return; }
+    if (base === null) { if (f.full) { base = f.odo; baseDate = f.date; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true; } return; }
     accL += f.liters; accCost += f.total;
     if (f.full) {
       const km = f.odo - base;
@@ -162,12 +172,108 @@ function enrich(list, v = vehicle()) {
         // Il carburante bruciato nel tratto è quello del pieno iniziale (più gli eventuali parziali):
         // il tratto vale per un carburante solo se non ne sono stati mescolati altri
         f.segFuel = pure ? baseFuel : null;
+        f.segFrom = baseDate;
       }
-      base = f.odo; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true;
+      base = f.odo; baseDate = f.date; accL = 0; accCost = 0; baseFuel = f.fuelName; pure = true;
     } else if (f.fuelName !== baseFuel) pure = false;
   });
   return rows;
 }
+
+/* ============ Consumi appresi per tipo di strada ============ */
+/*
+ * A ogni pieno, se indichi le strade fatte, il ciclo da pieno a pieno diventa un'equazione:
+ *   litri = (km urbani × U + km extraurbani × E + km autostrada × A) / 100 × stagione
+ * I tre consumi si ricavano con i minimi quadrati, con un "freno" che li tiene vicini ai valori di
+ * partenza (quelli del libretto): finché i cicli hanno proporzioni simili, i tre valori si spostano
+ * insieme; si separano solo quando arrivano cicli con proporzioni diverse.
+ * Si ricalcola sempre da tutti i dati: correggere o eliminare un rifornimento aggiorna il risultato.
+ */
+const ROAD_ORDER = ['urban', 'extra', 'highway'];
+const ROAD_LABEL = { urban: 'Urbana', extra: 'Extraurbana', highway: 'Autostrada' };
+// Taratura del "freno": errore tipico della misura di un pieno (la pompa non scatta sempre allo stesso
+// livello) e incertezza attribuita ai valori di partenza, in percentuale, secondo la velocità scelta
+const PUMP_ERR_L = 1.5;
+const LEARN_PRIOR_FRAC = { slow: 0.10, normal: 0.20, fast: 0.35 };
+const SEASON_PRIOR = 0.08;                                     // variazione stagionale attesa prima dei dati
+
+/** Valori di partenza: quelli del libretto; se ne manca uno, il misto (o la media) × il coefficiente. */
+function priorCons(v, s) {
+  const c = v.cons || {}, mixed = num(c.mixed) > 0 ? num(c.mixed) : s?.avgCons > 0 ? s.avgCons : 6.5;
+  return Object.fromEntries(ROAD_KEYS.map(t => [t, num(c[t]) > 0 ? num(c[t]) : mixed * routeFactor(t)]));
+}
+/** Km per tipo di strada di un ciclo: tragitti salvati × volte, più gli altri km con le loro percentuali. */
+function cycleRoadKm(cycle, segKm) {
+  const tripKmTot = sum(cycle.parts, x => x.n * x.km);
+  const scale = tripKmTot > segKm ? segKm / tripKmTot : 1, other = Math.max(0, segKm - tripKmTot);
+  const km = { highway: 0, extra: 0, urban: 0 };
+  cycle.parts.forEach(x => ROAD_KEYS.forEach(t => { km[t] += x.n * x.km * scale * x.mix[t] / 100; }));
+  ROAD_KEYS.forEach(t => { km[t] += other * cycle.other[t] / 100; });
+  return km;
+}
+/** Andamento stagionale: +1 a metà gennaio, −1 a metà luglio. */
+function seasonG(ms) {
+  const d = new Date(ms), doy = (d - new Date(d.getFullYear(), 0, 1)) / 864e5;
+  return Math.cos(2 * Math.PI * (doy - 14) / 365.25);
+}
+/** Sistema lineare piccolo (eliminazione di Gauss con pivot). */
+function solveLin(M, b) {
+  const n = b.length, a = M.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    const piv = a.reduce((best, r, i) => (i >= c && Math.abs(r[c]) > Math.abs(a[best][c]) ? i : best), c);
+    [a[c], a[piv]] = [a[piv], a[c]];
+    for (let r = 0; r < n; r++) if (r !== c) { const k = a[r][c] / a[c][c]; for (let j = c; j <= n; j++) a[r][j] -= k * a[c][j]; }
+  }
+  return a.map((r, i) => r[n] / r[i]);
+}
+function learnConsumption(v = vehicle()) {
+  const rows = enrich(db.fillups.filter(f => f.vid === v.id), v), s = computeStats(rows), main = fuelsOf(v)[0];
+  const prior = priorCons(v, s);
+  // solo cicli completi (con le strade indicate) e percorsi con il carburante principale
+  const cyc = rows.filter(r => r.cons != null && r.cycle && r.segFuel === main && r.segFrom).map(r => {
+    const t = (parseDate(r.segFrom).getTime() + parseDate(r.date).getTime()) / 2;
+    return { km: cycleRoadKm(r.cycle, r.segKm), L: r.segL, t, g: seasonG(t), w: 0.5 ** ((Date.now() - t) / (365 * 864e5)) };   // dimezza in un anno
+  });
+  const res = { n: cyc.length, prior, c: { ...prior }, A: 0, seasonOn: false, rel: { highway: 0, extra: 0, urban: 0 }, km: { highway: 0, extra: 0, urban: 0 } };
+  if (!cyc.length) return res;
+  cyc.forEach(cy => ROAD_KEYS.forEach(t => { res.km[t] += cy.km[t]; }));
+  // peso del freno per tipo: (errore del pieno / incertezza del valore di partenza)²
+  const frac = LEARN_PRIOR_FRAC[v.learnSpeed] || LEARN_PRIOR_FRAC.normal;
+  const lam = ROAD_KEYS.map(t => (PUMP_ERR_L / (frac * prior[t])) ** 2);
+  // la stagione si impara solo con dati sia invernali sia estivi, altrimenti si confonderebbe col livello generale
+  res.seasonOn = cyc.filter(c => c.g > 0.3).length >= 2 && cyc.filter(c => c.g < -0.3).length >= 2;
+  let A = 0, M;
+  for (let it = 0; it < 25; it++) {
+    // 1) consumi per tipo, con la stagione fissata
+    M = ROAD_KEYS.map((_, i) => ROAD_KEYS.map((_, j) => (i === j ? lam[i] : 0)));
+    const b = ROAD_KEYS.map((t, i) => lam[i] * prior[t]);
+    cyc.forEach(cy => {
+      const x = ROAD_KEYS.map(t => cy.km[t] / 100 * (1 + A * cy.g));
+      x.forEach((xi, i) => { b[i] += cy.w * xi * cy.L; x.forEach((xj, j) => { M[i][j] += cy.w * xi * xj; }); });
+    });
+    solveLin(M, b).forEach((val, i) => { res.c[ROAD_KEYS[i]] = Math.min(25, Math.max(2, val)); });
+    if (!res.seasonOn) break;
+    // 2) stagione, con i consumi fissati (freno verso 0)
+    const pred = cyc.map(cy => sum(ROAD_KEYS, t => cy.km[t] * res.c[t]) / 100);
+    let num1 = 0, den = (PUMP_ERR_L / SEASON_PRIOR) ** 2;
+    cyc.forEach((cy, i) => { num1 += cy.w * pred[i] * cy.g * (cy.L - pred[i]); den += cy.w * (pred[i] * cy.g) ** 2; });
+    const nA = Math.max(-0.3, Math.min(0.3, num1 / den));
+    if (Math.abs(nA - A) < 1e-6) { A = nA; break; }
+    A = nA;
+  }
+  res.A = res.seasonOn ? A : 0;
+  // affidabilità: quanto i dati hanno ristretto l'incertezza rispetto al valore di partenza (0 = nulla, 1 = del tutto)
+  ROAD_KEYS.forEach((t, i) => {
+    const e = ROAD_KEYS.map((_, j) => (i === j ? 1 : 0));
+    res.rel[t] = Math.max(0, Math.min(1, 1 - lam[i] * solveLin(M, e)[i]));
+  });
+  // consumo "misto" appreso: media sulle proporzioni dei tuoi cicli
+  const tot = sum(ROAD_KEYS, t => res.km[t]);
+  res.mixed = tot > 0 ? sum(ROAD_KEYS, t => res.km[t] * res.c[t]) / tot : null;
+  return res;
+}
+const seasonFactor = (L, dateStr) => (L.seasonOn ? 1 + L.A * seasonG(parseDate(dateStr).getTime()) : 1);
+const relLabel = r => (r > 0.7 ? 'affidabile' : r > 0.3 ? 'in formazione' : 'pochi dati');
 
 /** Medie per carburante: prezzo dai rifornimenti, consumo dai tratti percorsi con quel solo carburante. */
 function fuelStats(rows, v = vehicle()) {
@@ -401,6 +507,14 @@ function fillupSheet(id) {
   // carburante proposto: quello del rifornimento, altrimenti l'ultimo usato
   const curFuel = f ? fuelOf(f, veh) : rows.length ? rows[rows.length - 1].fuelName : fuels[0];
   const fuelOpts = fuels.includes(curFuel) ? fuels : [...fuels, curFuel];
+  // Strade del ciclo: si propongono gli itinerari e le percentuali dell'ultimo pieno (le volte vanno inserite)
+  const usableTrips = db.trips.filter(t => t.mix && tripKm(t).tot > 0);
+  const tripPart = (t, n = '') => ({ tripId: t.id, name: t.name, km: tripKm(t).tot, mix: { ...t.mix }, n });
+  const lastCycle = [...rows].reverse().find(x => x.full && x.cycle && (!f || x.id !== f.id))?.cycle;
+  const cyc = f?.cycle ? clone(f.cycle)
+    : lastCycle ? { parts: lastCycle.parts.map(x => { const t = usableTrips.find(u => u.id === x.tripId); return t ? tripPart(t) : { ...x, n: '' }; }), other: { ...lastCycle.other } }
+    : { parts: usableTrips.length ? [tripPart(usableTrips[0])] : [], other: { urban: 34, extra: 33, highway: 33 } };
+  const cycOn = !!f?.cycle || (!f && !!lastCycle);
   openSheet(`
     <h2>${f ? 'Modifica rifornimento' : 'Nuovo rifornimento'}</h2>
     <form id="fForm" autocomplete="off" novalidate>
@@ -417,6 +531,20 @@ function fillupSheet(id) {
         <div class="hint" id="fHint"></div></div>
       ${fuelOpts.length > 1 ? `<div class="field"><label for="fFuel">Carburante</label><select id="fFuel">${fuelOpts.map(x => `<option ${x === curFuel ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>` : ''}
       <label class="check"><input id="fFull" type="checkbox" ${v.full ? 'checked' : ''}> <span>Serbatoio pieno <span class="muted small">(necessario per calcolare il consumo)</span></span></label>
+      <div id="fCycle" class="cycle" hidden>
+        <label class="check" style="margin-bottom:6px"><input type="checkbox" id="fCycOn" ${cycOn ? 'checked' : ''}> <span>Indica le strade fatte dall'ultimo pieno <span class="muted small">(affina i consumi per tipo di strada)</span></span></label>
+        <div id="fCycBody">
+          <div class="hint" id="fCycInfo" style="margin-bottom:8px"></div>
+          <div id="fCycTrips"></div>
+          ${usableTrips.length ? '<button type="button" class="btn secondary block" id="fCycAdd" style="margin-bottom:10px">+ Aggiungi itinerario</button>'
+            : '<p class="hint" style="margin:0 0 10px">Per contare i tragitti abituali (es. casa-lavoro) salvali con il percorso calcolato nella sezione Itinerario.</p>'}
+          <div id="fCycOther">
+            <div class="hint" id="fCycOtherKm" style="margin-bottom:4px"></div>
+            ${ROAD_ORDER.map(t => `<div class="slider"><span>${ROAD_LABEL[t]}</span><input type="range" min="0" max="100" step="1" data-mixk="${t}" value="${cyc.other[t]}" aria-label="${ROAD_LABEL[t]} %"><b data-mixv="${t}">${cyc.other[t]}%</b></div>`).join('')}
+          </div>
+          <div id="fCycMix"></div>
+        </div>
+      </div>
       <div class="field"><label for="fNote">Note</label><input id="fNote" value="${esc(v.note || '')}" placeholder="opzionale (distributore, ecc.)"></div>
       <div class="btns">
         ${f ? '<button type="button" class="btn danger" id="fDel">Elimina</button>' : ''}
@@ -443,6 +571,64 @@ function fillupSheet(id) {
         ? ` (${eff < P ? 'sconto' : 'extra'} ${eur(Math.abs(P - eff), 3)}/L rispetto alla pompa)` : '');
     } else hint.textContent = 'Bastano due valori tra litri, prezzo alla pompa e importo: il terzo si calcola.';
   };
+  // ---- strade del ciclo
+  const cycBox = $('#fCycle');
+  const prevFull = odo => rows.filter(x => x.full && (!f || x.id !== f.id) && x.odo < odo).pop();
+  const renderParts = () => {
+    $('#fCycTrips').innerHTML = cyc.parts.map((x, i) => `<div class="cyc-row">
+      <select data-cyctrip="${i}" aria-label="Itinerario">${usableTrips.map(t => `<option value="${t.id}" ${t.id === x.tripId ? 'selected' : ''}>${esc(t.name)} (${nf(tripKm(t).tot, 1)} km)</option>`).join('')}
+        ${usableTrips.some(t => t.id === x.tripId) ? '' : `<option value="${esc(x.tripId)}" selected>${esc(x.name)} (${nf(x.km, 1)} km)</option>`}</select>
+      <span class="times">×</span><input data-cycn="${i}" inputmode="decimal" value="${x.n === '' ? '' : String(x.n).replace('.', ',')}" placeholder="volte" aria-label="Volte">
+      <button type="button" class="icon-btn" data-cycdel="${i}" aria-label="Rimuovi itinerario">×</button></div>`).join('');
+  };
+  /** Ricalcola il riepilogo del ciclo; restituisce km del ciclo, dei tragitti e degli altri. */
+  const calcCycle = () => {
+    const odo = numInt($('#fOdo').value), base = Number.isFinite(odo) ? prevFull(odo) : null;
+    cycBox.hidden = !$('#fFull').checked || !base;
+    if (cycBox.hidden) return null;
+    $('#fCycBody').hidden = !$('#fCycOn').checked;
+    const segKm = odo - base.odo, days = daysBetween(base.date, $('#fDate').value || today());
+    $('#fCycInfo').textContent = `Dal pieno del ${fmtDate(base.date)}: ${days} ${days === 1 ? 'giorno' : 'giorni'}, ${nf(segKm, 0)} km.`;
+    const tk = sum(cyc.parts, x => (num(x.n) > 0 ? num(x.n) : 0) * x.km), other = segKm - tk;
+    $('#fCycOther').hidden = other <= 0.5;
+    $('#fCycOtherKm').innerHTML = tk > segKm * 1.05
+      ? `<span class="bad">I tragitti (${nf(tk, 0)} km) superano i km dall'ultimo pieno: controlla il numero di volte.</span>`
+      : `${tk > 0 ? `Tragitti: ${nf(tk, 0)} km. ` : ''}Altri km: <b>${nf(Math.max(0, other), 0)}</b>, ripartiti così:`;
+    const parts = cyc.parts.map(x => ({ ...x, n: num(x.n) > 0 ? num(x.n) : 0 }));
+    const km = segKm > 0 ? cycleRoadKm({ parts, other: cyc.other }, segKm) : null, totKm = km ? sum(ROAD_KEYS, t => km[t]) : 0;
+    $('#fCycMix').innerHTML = totKm > 0 ? `<div class="road-bar">${ROAD_ORDER.map(t => `<i style="width:${(km[t] / totKm * 100).toFixed(2)}%;background:${ROAD[t].color}"></i>`).join('')}</div>
+      <div class="hint">Ciclo: ${ROAD_ORDER.map(t => `${ROAD_LABEL[t].toLowerCase()} ${nf(km[t] / totKm * 100, 0)}%`).join(' · ')}</div>` : '';
+    return { segKm, tk, other };
+  };
+  renderParts();
+  cycBox.addEventListener('input', e => {
+    const t = e.target;
+    if (t.dataset.cycn != null) cyc.parts[+t.dataset.cycn].n = t.value;
+    else if (t.dataset.mixk) {
+      // i tre cursori sommano sempre 100: gli altri due si ridimensionano in proporzione
+      const k = t.dataset.mixk, val = +t.value, others = ROAD_ORDER.filter(x => x !== k), rest = 100 - val;
+      const o = others.map(x => cyc.other[x]), osum = o[0] + o[1];
+      const a = osum > 0 ? Math.round(rest * o[0] / osum) : Math.floor(rest / 2);
+      cyc.other[k] = val; cyc.other[others[0]] = a; cyc.other[others[1]] = rest - a;
+      ROAD_ORDER.forEach(x => { cycBox.querySelector(`[data-mixk="${x}"]`).value = cyc.other[x]; cycBox.querySelector(`[data-mixv="${x}"]`).textContent = cyc.other[x] + '%'; });
+    }
+    calcCycle();
+  });
+  cycBox.addEventListener('change', e => {
+    const t = e.target;
+    if (t.dataset.cyctrip != null) { const tr = usableTrips.find(u => u.id === t.value); if (tr) cyc.parts[+t.dataset.cyctrip] = tripPart(tr, cyc.parts[+t.dataset.cyctrip].n); }
+    calcCycle();
+  });
+  cycBox.addEventListener('click', e => {
+    const del = e.target.closest('[data-cycdel]');
+    if (del) cyc.parts.splice(+del.dataset.cycdel, 1);
+    else if (e.target.closest('#fCycAdd')) cyc.parts.push(tripPart(usableTrips.find(t => !cyc.parts.some(x => x.tripId === t.id)) || usableTrips[0]));
+    else return;
+    renderParts(); calcCycle();
+  });
+  ['#fOdo', '#fDate', '#fFull'].forEach(sel => $(sel).addEventListener('input', calcCycle));
+  calcCycle();
+
   lit.addEventListener('input', () => { litAuto = false; refresh(); });
   pump.addEventListener('input', refresh);
   tot.addEventListener('input', () => { totAuto = false; refresh(); });
@@ -472,6 +658,12 @@ function fillupSheet(id) {
     if (ppl < 0.5 || ppl > 4) warn.push(`il prezzo risulta ${eur(ppl, 3)}/L`);
     if (tank > 0 && rec.liters > tank * 1.05) warn.push(`${nf(rec.liters, 1)} L superano il serbatoio da ${nf(tank, 0)} L`);
     if (rec.date > today()) warn.push('la data è nel futuro');
+    const cy = calcCycle();
+    if (cy && $('#fCycOn').checked) {
+      if (cyc.parts.some(x => String(x.n).trim() !== '' && !(num(x.n) >= 0))) return toast('Numero di volte non valido');
+      if (cy.tk > cy.segKm * 1.05) warn.push(`i tragitti (${nf(cy.tk, 0)} km) superano i km dall'ultimo pieno (${nf(cy.segKm, 0)} km)`);
+      rec.cycle = { parts: cyc.parts.map(x => ({ ...x, n: num(x.n) })).filter(x => x.n > 0), other: { ...cyc.other } };
+    }
     if (warn.length && !confirm(`Controlla i dati: ${warn.join('; ')}. Salvare comunque?`)) return;
     const others = rows.filter(r => !f || r.id !== f.id);
     if (others.some(r => r.odo === rec.odo) && !confirm('Esiste già un rifornimento con gli stessi km. Salvare comunque?')) return;
@@ -596,8 +788,9 @@ const ROUTE_NAME = { mixed: 'Misto', urban: 'Urbano', extra: 'Extraurbano', high
 function renderTrip(el) {
   const p = db.prefs.trip, s = stats(), v = vehicle(), ret = dirObj(p, 'ret');
   const hasHist = !!s.avgCons;
-  let consSrc = p.consSrc || (hasHist ? 'avg' : 'vehicle');
-  if ((consSrc === 'last5' && (!hasHist || s.estimated)) || (consSrc === 'avg' && !hasHist)) consSrc = 'vehicle';
+  const LC = learnConsumption(v);
+  let consSrc = p.consSrc || (LC.n ? 'learned' : hasHist ? 'avg' : 'vehicle');
+  if ((consSrc === 'last5' && (!hasHist || s.estimated)) || (consSrc === 'avg' && !hasHist) || (consSrc === 'learned' && !LC.n)) consSrc = 'vehicle';
   const priceSrc = p.priceSrc || (s.n ? 'avg' : 'manual');
   const src = tripSources(p, s);
   const sel = (val, cur, label) => `<option value="${val}" ${val === cur ? 'selected' : ''}>${label}</option>`;
@@ -646,11 +839,13 @@ function renderTrip(el) {
   </div>
   <div class="card"><h2>Consumo del veicolo</h2>
     <div class="field"><select id="tConsSrc" aria-label="Origine consumo">
+      ${LC.n ? sel('learned', consSrc, `Appresi dai rifornimenti (${LC.n} ${LC.n === 1 ? 'ciclo' : 'cicli'})`) : ''}
       ${s.estimated ? sel('avg', consSrc, `Stima dai rifornimenti (${consFmt(s.avgCons)})`)
         : hasHist ? sel('avg', consSrc, `Media storica (${consFmt(src.cs.avgCons)})`) + sel('last5', consSrc, `Ultimi 5 pieni (${consFmt(src.cs.cons5)})`) : ''}
-      ${sel('vehicle', consSrc, 'Dati inseriti nel veicolo')}${sel('manual', consSrc, 'Manuale')}
+      ${sel('vehicle', consSrc, 'Valori di partenza (libretto)')}${sel('manual', consSrc, 'Manuale')}
     </select></div>
     <div class="field" id="tConsManualBox"><label for="tConsManual">Consumo (${consUnit()})</label><input id="tConsManual" inputmode="decimal" value="${esc(p.consManual || '')}" placeholder="es. ${kml() ? '15,5' : '6,5'}"></div>
+    <div class="field" id="tWhenBox" hidden><label for="tWhen">Data del viaggio</label><input id="tWhen" type="date" value="${esc(p.when || today())}"></div>
     <div class="hint small muted" id="tConsNote"></div>
   </div>
   <div class="card"><h2>Prezzo del carburante</h2>
@@ -857,6 +1052,12 @@ function tripConsumption(p, s, v) {
   const c = v.cons || {}, out = { mixed: NaN, highway: NaN, extra: NaN, urban: NaN }, derived = [];
   const cs = tripSources(p, s).cs;
   const base = p.consSrc === 'avg' ? cs.avgCons : p.consSrc === 'last5' ? cs.cons5 : null;
+  if (p.consSrc === 'learned') {
+    const L = learnConsumption(v), sf = seasonFactor(L, p.when || today());
+    ROAD_KEYS.forEach(t => { out[t] = L.c[t] * sf; });
+    out.mixed = (L.mixed || L.c.extra) * sf;
+    return { out, derived, base: false, learned: L, sf };
+  }
   if (base) { out.mixed = base; ROAD_KEYS.forEach(t => out[t] = base * routeFactor(t)); }
   else if (p.consSrc === 'vehicle') {
     out.mixed = num(c.mixed);
@@ -874,12 +1075,13 @@ function tripUpdate() {
   Object.assign(p, {
     from: g('#tFrom'), to: g('#tTo'), km: g('#tKm'), rt: g('#tRt'), round: $('#tRound').checked,
     consSrc: g('#tConsSrc'), consManual: g('#tConsManual'), priceSrc: g('#tPriceSrc'), priceManual: g('#tPriceManual'),
-    toll: g('#tToll'), people: g('#tPeople'), avoid: $('#tAvoid').checked,
+    toll: g('#tToll'), people: g('#tPeople'), avoid: $('#tAvoid').checked, when: g('#tWhen'),
   });
   Object.assign(ret, { km: g('#rKm'), on: $('#tRetOn').checked });
   save();
   $('#tConsManualBox').hidden = p.consSrc !== 'manual';
   $('#tPriceManualBox').hidden = p.priceSrc !== 'manual';
+  $('#tWhenBox').hidden = p.consSrc !== 'learned';
   const retDiff = p.round && ret.on;
   $('#tRetBox').hidden = !p.round; $('#tRetFields').hidden = !retDiff;
 
@@ -892,7 +1094,7 @@ function tripUpdate() {
   const norm = r => { const t = r ? sum(ROAD_KEYS, k => r.km[k]) : 0; return t > 0 ? Object.fromEntries(ROAD_KEYS.map(k => [k, r.km[k] / t])) : null; };
   const shOut = norm(p.route) || norm(ret.route), shRet = retDiff ? norm(ret.route) || shOut : shOut;
   const auto = p.rt === 'auto' && !!shOut;
-  const { out, derived, base } = tripConsumption(p, s, v);
+  const { out, derived, base, learned, sf } = tripConsumption(p, s, v);
   const fx = t => nf(routeFactor(t), 2);
   let cons = NaN, note = '', parts = null;
 
@@ -912,6 +1114,8 @@ function tripUpdate() {
     if (base) {
       cons = out.mixed * f;
       note = f === 1 ? '' : `Il consumo storico è stato corretto di ×${nf(f, 2)} per il percorso "${ROUTE_NAME[p.rt]}" (stima).`;
+    } else if (learned) {
+      cons = p.rt === 'mixed' ? out.mixed : out[p.rt];
     } else if (p.consSrc === 'vehicle') {
       cons = p.rt === 'mixed' ? out.mixed : out[p.rt];
       if (derived.includes(p.rt)) note = `Nessun consumo "${ROUTE_NAME[p.rt]}" nel veicolo: uso il misto corretto di ×${nf(f, 2)} (stima).`;
@@ -920,6 +1124,14 @@ function tripUpdate() {
   }
   const src = tripSources(p, s);
   if (src.consFallback && base) note = `Non ci sono ancora tratti percorsi solo con "${src.fu.name}": uso il consumo medio generale. ` + note;
+  if (learned) {
+    const used = auto && parts ? parts.map(x => x.t) : p.rt === 'mixed' ? ROAD_KEYS : [p.rt];
+    const weak = used.filter(t => learned.rel[t] < 0.3);
+    note = `Consumi appresi da ${learned.n} ${learned.n === 1 ? 'ciclo' : 'cicli'}.`
+      + (learned.seasonOn ? ` Correzione stagionale per il ${fmtDate(p.when || today())}: ${sf >= 1 ? '+' : '−'}${nf(Math.abs(sf - 1) * 100, 0)}%.`
+        : ' La correzione stagionale si attiva dopo almeno un inverno e un\'estate di dati.')
+      + (weak.length ? ` Pochi dati per: ${weak.map(t => ROAD_LABEL[t].toLowerCase()).join(', ')} (valore vicino a quello di partenza).` : '');
+  }
   $('#tConsNote').textContent = note;
 
   // prezzo
@@ -1419,6 +1631,26 @@ function updateBadge() {
 }
 
 /* ============ Impostazioni ============ */
+function learnCard(v, seg) {
+  const L = learnConsumption(v);
+  const speed = `<div class="setting" style="margin:12px 0 0"><span>Velocità</span>${seg('learn', v.learnSpeed || 'normal', [['slow', 'Prudente'], ['normal', 'Normale'], ['fast', 'Veloce']])}</div>
+    <p class="muted small" style="margin:6px 0 0">Prudente: servono più dati per allontanarsi dai valori di partenza. Veloce: segue prima i tuoi pieni, ma risente di più degli errori di misura.</p>`;
+  if (!L.n) {
+    return `<div class="card"><h2>Consumi appresi dai pieni</h2>
+      <p style="margin:0">Quando registri un pieno, attiva "Indica le strade fatte dall'ultimo pieno": scegli i tuoi itinerari salvati con il numero di volte e regola le percentuali degli altri km.
+      A ogni ciclo i tre consumi si affinano partendo dai valori qui sopra.</p>${speed}</div>`;
+  }
+  const rowsHtml = ROAD_ORDER.map(t => `<div class="line"><span>${ROAD_LABEL[t]} <small class="muted">${nf(L.km[t], 0)} km · ${relLabel(L.rel[t])}</small></span>
+    <b>${consFmt(L.c[t], true)} <small class="muted">da ${nf(consVal(L.prior[t]), consDec())}</small></b></div>`).join('');
+  const season = L.seasonOn
+    ? `Variazione stagionale: ${L.A >= 0 ? '+' : '−'}${nf(Math.abs(L.A) * 100, 0)}% a metà gennaio, ${L.A >= 0 ? '−' : '+'}${nf(Math.abs(L.A) * 100, 0)}% a metà luglio. I tre valori sono medie annue.`
+    : 'La variazione stagionale si calcola quando ci sono almeno due cicli invernali e due estivi.';
+  return `<div class="card"><h2>Consumi appresi dai pieni</h2>
+    <div class="result">${rowsHtml}</div>
+    <p class="muted small" style="margin:8px 0 0">Da ${L.n} ${L.n === 1 ? 'ciclo' : 'cicli'} con le strade indicate, solo con il carburante principale. ${season}
+      Un valore "pochi dati" resta vicino a quello di partenza finché non fai cicli con più strade di quel tipo.</p>${speed}</div>`;
+}
+
 function renderSettings(el) {
   const v = vehicle(), c = v.cons || {}, st = db.settings;
   const seg = (name, cur, opts) => `<div class="seg" data-seg="${name}">${opts.map(([k, l]) => `<button type="button" data-val="${k}" class="${k === cur ? 'on' : ''}">${l}</button>`).join('')}</div>`;
@@ -1434,7 +1666,7 @@ function renderSettings(el) {
     </div>
     ${badgeOk ? `<button class="btn secondary block" id="sBadge" type="button">${Notification.permission === 'granted' ? 'Numero di scadenze sull\'icona: attivo' : 'Mostra il numero di scadenze sull\'icona'}</button>` : ''}
     <h2 style="margin-top:16px">Correzione consumo per tipo di percorso</h2>
-    <p class="muted small" style="margin-top:0">Moltiplicatori applicati al consumo storico nell'itinerario (1 = nessuna correzione).</p>
+    <p class="muted small" style="margin-top:0">Moltiplicatori della media (1 = nessuna correzione), usati nell'itinerario con "Media storica" e "Manuale" e per i valori di partenza mancanti (es. autostrada). Con "Appresi dai rifornimenti" non servono.</p>
     <div class="two">
       <div class="field"><label for="sfU">Urbano</label><input id="sfU" inputmode="decimal" value="${esc(String(st.factors.urban).replace('.', ','))}"></div>
       <div class="field"><label for="sfE">Extraurbano</label><input id="sfE" inputmode="decimal" value="${esc(String(st.factors.extra).replace('.', ','))}"></div>
@@ -1450,8 +1682,8 @@ function renderSettings(el) {
       </div>
       <div class="field"><label for="vFuel">Carburanti</label><input id="vFuel" value="${esc(fuelsOf(v).join(', '))}" placeholder="es. Benzina, Benzina 100 ottani">
         <div class="hint">Separati da virgola: il primo è quello abituale. Con più carburanti puoi sceglierlo a ogni rifornimento e confrontarne consumo e costo.</div></div>
-      <h2 style="margin-top:16px">Consumi dichiarati (L/100 km)</h2>
-      <p class="muted small" style="margin-top:0">Usati nell'itinerario quando scegli "Dati inseriti nel veicolo" (es. dal libretto o dal computer di bordo).</p>
+      <h2 style="margin-top:16px">Consumi di partenza (L/100 km)</h2>
+      <p class="muted small" style="margin-top:0">Dal libretto o dal computer di bordo. L'app non li modifica: sono il punto di partenza dei consumi appresi dai pieni.</p>
       <div class="two">
         <div class="field"><label for="vcU">Urbano</label><input id="vcU" inputmode="decimal" value="${esc(c.urban || '')}"></div>
         <div class="field"><label for="vcM">Misto</label><input id="vcM" inputmode="decimal" value="${esc(c.mixed || '')}"></div>
@@ -1463,6 +1695,7 @@ function renderSettings(el) {
       <button class="btn block" type="submit">Salva veicolo</button>
     </form>
   </div>
+  ${learnCard(v, seg)}
   <div class="card"><h2>Veicoli</h2>
     <div class="list">${db.vehicles.map(x => `<button class="row" data-veh="${x.id}"><span class="t">${esc(x.name)} ${esc(x.year || '')}${x.id === v.id ? '<span class="badge">in uso</span>' : ''}</span><span class="r">›</span></button>`).join('')}</div>
     <div class="btns" style="margin-top:12px">
@@ -1486,7 +1719,9 @@ function renderSettings(el) {
   <p class="muted small" style="text-align:center">Consumi Carburante · i dati sono salvati solo su questo dispositivo</p>`;
 
   $$('[data-seg] button').forEach(b => b.onclick = () => {
-    st[b.parentElement.dataset.seg] = b.dataset.val; save(); applyTheme(); render();
+    if (b.parentElement.dataset.seg === 'learn') v.learnSpeed = b.dataset.val;
+    else st[b.parentElement.dataset.seg] = b.dataset.val;
+    save(); applyTheme(); render();
   });
   const bindNum = (id, set, parse = num) => $(id).addEventListener('change', e => { const n = parse(e.target.value); if (n >= 0) { set(n); save(); updateBadge(); } else toast('Valore non valido'); });
   bindNum('#sDays', n => st.warnDays = Math.round(n));
