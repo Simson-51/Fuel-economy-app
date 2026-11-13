@@ -1,4 +1,4 @@
-const CACHE = 'consumi-v9';
+const CACHE = 'consumi-v10';
 // File indispensabili: se uno manca l'installazione fallisce e resta la versione precedente
 const CORE = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
@@ -7,8 +7,10 @@ const EXTRA = ['vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(async c => {
-    await c.addAll(CORE);
-    await Promise.all(EXTRA.map(u => c.add(u).catch(() => {})));
+    // cache: 'reload' evita di ripescare file vecchi dalla cache HTTP del browser
+    const fresh = u => new Request(u, { cache: 'reload' });
+    await c.addAll(CORE.map(fresh));
+    await Promise.all(EXTRA.map(u => c.add(fresh(u)).catch(() => {})));
   }).then(() => self.skipWaiting()));
 });
 
