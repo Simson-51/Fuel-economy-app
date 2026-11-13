@@ -7,9 +7,12 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const num = v => {
   if (v == null) return NaN;
-  const s = String(v).trim().replace(/\s/g, '').replace(',', '.');
+  let s = String(v).trim().replace(/\s/g, '');
+  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');   // "1.234,5" → 1234.5
   return s === '' ? NaN : Number(s);
 };
+// Numeri interi (km): il punto è sempre un separatore delle migliaia ("123.456" → 123456)
+const numInt = v => v == null ? NaN : Math.round(num(String(v).replace(/\./g, '')));
 const nf = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('it-IT', { minimumFractionDigits: d, maximumFractionDigits: d }) : '–';
 const eur = (n, d = 2) => Number.isFinite(n) ? n.toLocaleString('it-IT', { style: 'currency', currency: 'EUR', minimumFractionDigits: d, maximumFractionDigits: d }) : '–';
 const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -47,20 +50,53 @@ function defaultDb() {
 function defaultSettings() {
   return { theme: 'auto', unit: 'l100', warnDays: 30, warnKm: 1000, factors: { urban: 1.2, extra: 0.9, highway: 1.1 } };
 }
-/** Completa i dati salvati da versioni precedenti (o da un backup) con i campi nuovi. */
+/**
+ * Completa i dati salvati da versioni precedenti (o da un backup) con i campi nuovi e scarta
+ * le voci non valide: un record malformato non deve bloccare l'app.
+ */
 function normalize(d) {
-  d.prefs ||= {}; d.prefs.trip ||= {};
-  d.maint ||= [];
-  const def = defaultSettings();
-  d.settings = { ...def, ...d.settings, factors: { ...def.factors, ...d.settings?.factors } };
-  if (!d.vehicles.some(x => x.id === d.active)) d.active = d.vehicles[0].id;
+  const obj = x => x && typeof x === 'object' && !Array.isArray(x);
+  const cleanId = x => String(x ?? '').replace(/[^\w-]/g, '');
+  const isDate = x => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x) && !isNaN(parseDate(x));
+  const pos = x => (Number(x) > 0 ? Number(x) : null);
+  d.vehicles = d.vehicles.filter(obj).map(v => ({ ...v, id: cleanId(v.id), name: String(v.name || 'Veicolo'), cons: obj(v.cons) ? v.cons : {} })).filter(v => v.id);
+  if (!d.vehicles.length) throw new Error('no-vehicles');
+  const vids = new Set(d.vehicles.map(v => v.id));
+  d.fillups = (Array.isArray(d.fillups) ? d.fillups : []).filter(obj)
+    .map(f => ({ ...f, id: cleanId(f.id) || uid(), vid: cleanId(f.vid), odo: Number(f.odo), liters: Number(f.liters), total: Number(f.total),
+      pump: pos(f.pump), full: !!f.full, note: String(f.note || '') }))
+    .filter(f => vids.has(f.vid) && isDate(f.date) && f.odo >= 0 && f.liters > 0 && f.total > 0);
+  d.maint = (Array.isArray(d.maint) ? d.maint : []).filter(obj)
+    .map(m => ({ ...m, id: cleanId(m.id) || uid(), vid: cleanId(m.vid), type: /^\w+$/.test(m.type) ? m.type : 'other', title: String(m.title || ''),
+      odo: pos(m.odo), cost: Number(m.cost) >= 0 ? Number(m.cost) : 0, nextDate: isDate(m.nextDate) ? m.nextDate : '', nextKm: pos(m.nextKm), note: String(m.note || '') }))
+    .filter(m => vids.has(m.vid) && isDate(m.date));
+  d.active = cleanId(d.active);
+  if (!vids.has(d.active)) d.active = d.vehicles[0].id;
+  const def = defaultSettings(), st = obj(d.settings) ? d.settings : {};
+  d.settings = { ...def, ...st, factors: { ...def.factors, ...(obj(st.factors) ? st.factors : {}) } };
+  if (!['auto', 'light', 'dark'].includes(d.settings.theme)) d.settings.theme = def.theme;
+  if (!['l100', 'kml'].includes(d.settings.unit)) d.settings.unit = def.unit;
+  ['warnDays', 'warnKm'].forEach(k => { if (!(Number(d.settings[k]) >= 0)) d.settings[k] = def[k]; });
+  // Itinerario: solo stringhe e percorsi ben formati
+  d.prefs = obj(d.prefs) ? d.prefs : {};
+  const t = d.prefs.trip = obj(d.prefs.trip) ? d.prefs.trip : {};
+  const cleanDir = o => {
+    o.via = Array.isArray(o.via) ? o.via.map(x => String(x ?? '')).slice(0, 3) : [];
+    if (!(obj(o.route) && obj(o.route.km) && ['highway', 'extra', 'urban'].every(k => Number.isFinite(o.route.km[k])))) delete o.route;
+    if (typeof o.dur !== 'string') delete o.dur;
+  };
+  cleanDir(t);
+  if (obj(t.ret)) cleanDir(t.ret); else delete t.ret;
   return d;
 }
 function load() {
+  const raw = localStorage.getItem(KEY);
   try {
-    const d = JSON.parse(localStorage.getItem(KEY));
-    if (d && Array.isArray(d.vehicles) && d.vehicles.length) return normalize(d);
+    const d = JSON.parse(raw);
+    if (d && Array.isArray(d.vehicles)) return normalize(d);
   } catch (e) { /* dati assenti o corrotti */ }
+  // Dati illeggibili: se ne tiene una copia, perché il primo salvataggio li sovrascriverebbe
+  if (raw) try { localStorage.setItem(KEY + '.corrotto', raw); } catch (e) { /* spazio esaurito */ }
   return defaultDb();
 }
 let db = load();
@@ -253,7 +289,7 @@ function fillupSheet(id) {
     <form id="fForm" autocomplete="off" novalidate>
       <div class="two">
         <div class="field"><label for="fDate">Data</label><input id="fDate" type="date" value="${v.date}" required></div>
-        <div class="field"><label for="fOdo">Km veicolo</label><input id="fOdo" inputmode="numeric" value="${v.odo}" placeholder="${lastOdo ? '> ' + nf(lastOdo, 0) : ''}"></div>
+        <div class="field"><label for="fOdo">Km veicolo</label><input id="fOdo" inputmode="numeric" value="${v.odo === '' ? '' : Math.round(v.odo)}" placeholder="${lastOdo ? '> ' + nf(lastOdo, 0) : ''}"></div>
       </div>
       <div class="two">
         <div class="field"><label for="fLit">Litri</label><input id="fLit" inputmode="decimal" value="${v.liters ? String(v.liters).replace('.', ',') : ''}" placeholder="0,00"></div>
@@ -296,7 +332,7 @@ function fillupSheet(id) {
     e.preventDefault();
     const rec = {
       id: f ? f.id : uid(), vid: vehicle().id, date: $('#fDate').value,
-      odo: num($('#fOdo').value), liters: num(lit.value), pump: num(pump.value), total: num(tot.value),
+      odo: numInt($('#fOdo').value), liters: num(lit.value), pump: num(pump.value), total: num(tot.value),
       full: $('#fFull').checked, note: $('#fNote').value.trim(),
     };
     if (!rec.date) return toast('Inserisci la data');
@@ -394,7 +430,9 @@ function renderCharts(el) {
     const m = months[monthKey(r.date)] ||= { spent: 0, km: 0, liters: 0 };
     m.spent += r.total; m.liters += r.liters; m.km += r.kmSincePrev || 0;
   });
-  const keys = Object.keys(months).sort().slice(-12);
+  // ultimi 12 mesi fino all'ultimo rifornimento, compresi i mesi senza dati
+  const lastKey = Object.keys(months).sort().pop(), firstKey = Object.keys(months).sort()[0], keys = [];
+  for (let k = lastKey; keys.length < 12 && k >= firstKey; k = monthKey(addMonths(k + '-01', -1))) { months[k] ||= { spent: 0, km: 0, liters: 0 }; keys.unshift(k); }
   html += card('Spesa mensile (€)', barChart(keys.map(k => ({ label: monthLabel(k), value: months[k].spent, tip: `${monthLabel(k)} · ${eur(months[k].spent)} · ${nf(months[k].liters, 1)} L` }))));
   if (rows.length > 1) html += card('Km percorsi al mese', barChart(keys.map(k => ({ label: monthLabel(k), value: months[k].km, tip: `${monthLabel(k)} · ${nf(months[k].km, 0)} km` }))));
   el.innerHTML = html;
@@ -479,8 +517,8 @@ function renderTrip(el) {
   // Cambiando partenza, destinazione, tappe o pedaggi il percorso calcolato non vale più.
   // Cambiando solo i km a mano, invece, restano le proporzioni tra i tipi di strada.
   const invalidate = which => {
-    if (which !== 'ret') { delete p.dur; delete p.route; lastRoutes.out = null; }
-    if (which !== 'out') { delete ret.dur; delete ret.route; lastRoutes.ret = null; }
+    if (which !== 'ret') { delete p.dur; delete p.route; lastRoutes.out = null; routeSeq.out++; }
+    if (which !== 'out') { delete ret.dur; delete ret.route; lastRoutes.ret = null; routeSeq.ret++; }
     if (!lastRoutes[mapView]) mapView = lastRoutes.out ? 'out' : lastRoutes.ret ? 'ret' : 'out';
     if (!(p.route || ret.route) && $('#tRt').value === 'auto') p.rt = 'mixed';
     $('#tRt').innerHTML = rtOptions(p);
@@ -638,6 +676,9 @@ const DIR = {
 // Tappe, percorso e durata dell'andata stanno direttamente in prefs.trip, quelli del ritorno in prefs.trip.ret
 const dirObj = (p, d) => d === 'out' ? p : (p.ret ||= { on: false, km: '', via: [] });
 let lastRoutes = { out: null, ret: null }, mapView = 'out', tripMap = null;
+// Cresce a ogni modifica del percorso: una risposta arrivata dopo viene scartata
+const routeSeq = { out: 0, ret: 0 };
+const resetTripState = () => { lastRoutes = { out: null, ret: null }; mapView = 'out'; routeSeq.out++; routeSeq.ret++; };
 
 /**
  * Divide il percorso OSRM in tratti: autostrada/superstrada, extraurbana o urbana.
@@ -759,6 +800,7 @@ async function routeLookup(dir) {
   const via = (o.via || []).map(x => x.trim()).filter(Boolean), avoid = $('#tAvoid').checked;
   if (!a || !b) { msg.textContent = 'Inserisci partenza e destinazione.'; return; }
   const btn = $(ids.btn); btn.disabled = true; msg.textContent = 'Calcolo del percorso…';
+  const seq = ++routeSeq[dir];
   const geo = async q => {
     const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=it&q=' + encodeURIComponent(q));
     if (!r.ok) throw new Error('geocode');
@@ -782,6 +824,8 @@ async function routeLookup(dir) {
     if (!r.ok) throw new Error('route');
     const j = await r.json();
     if (!j.routes?.length) throw new Error('route');
+    // Nel frattempo il percorso è stato modificato o si è cambiata schermata: risposta da scartare
+    if (seq !== routeSeq[dir] || !$(ids.km)) { if (msg.isConnected) msg.textContent = 'Il percorso è cambiato: ricalcolalo.'; return; }
     // Percorso più veloce e alternative: si tengono solo quelle di cui si riconoscono le strade
     const opts = [];
     j.routes.forEach(rt => { try { opts.push({ distance: rt.distance, duration: rt.duration, info: classifyRoute(rt) }); } catch (e) { /* senza dettaglio */ } });
@@ -798,6 +842,7 @@ async function routeLookup(dir) {
       tripUpdate(); refreshMap();
     }
   } catch (e) {
+    if (seq !== routeSeq[dir]) return;
     msg.textContent = String(e.message).startsWith('nf:')
       ? `Località non trovata: "${e.message.slice(3)}". Prova a essere più specifico.`
       : 'Impossibile calcolare il percorso (sei offline?). Inserisci i km a mano.';
@@ -964,7 +1009,7 @@ function maintSheet(id) {
   // Prossima scadenza suggerita in base al tipo, finché l'utente non la modifica
   let nextEdited = !!m;
   const suggest = () => {
-    const t = mtype($('#mType').value), date = $('#mDate').value, km = num($('#mOdo').value) || odo;
+    const t = mtype($('#mType').value), date = $('#mDate').value, km = numInt($('#mOdo').value) || odo;
     const every = [t.months && `${t.months} mesi`, t.km && `${nf(t.km, 0)} km`].filter(Boolean).join(' o ');
     $('#mHint').textContent = every ? `Intervallo suggerito: ogni ${every}. Lascia vuoto se non c'è una scadenza.` : 'Lascia vuoto se non c\'è una scadenza.';
     if (nextEdited) return;
@@ -984,8 +1029,8 @@ function maintSheet(id) {
     const costRaw = $('#mCost').value.trim(), cost = costRaw === '' ? 0 : num(costRaw);
     const rec = {
       id: m ? m.id : uid(), vid: vehicle().id, type: $('#mType').value, title: $('#mTitle').value.trim(),
-      date: $('#mDate').value, odo: num($('#mOdo').value) > 0 ? num($('#mOdo').value) : null, cost,
-      nextDate: $('#mNextDate').value || '', nextKm: num($('#mNextKm').value) > 0 ? num($('#mNextKm').value) : null,
+      date: $('#mDate').value, odo: numInt($('#mOdo').value) > 0 ? numInt($('#mOdo').value) : null, cost,
+      nextDate: $('#mNextDate').value || '', nextKm: numInt($('#mNextKm').value) > 0 ? numInt($('#mNextKm').value) : null,
       note: $('#mNote').value.trim(),
     };
     if (!rec.date) return toast('Inserisci la data');
@@ -1001,7 +1046,7 @@ function addToCalendar(id) {
   const d = deadlines().find(x => x.rec.id === id);
   if (!d) return;
   const m = d.rec, t = mtype(m.type), date = m.nextDate || d.estDate;
-  const icsEsc = x => String(x).replace(/[\;,]/g, c => '\\' + c).replace(/\n/g, '\\n');
+  const icsEsc = x => String(x).replace(/[\\;,]/g, c => '\\' + c).replace(/\n/g, '\\n');
   const title = `${m.title || t.name} – ${d.vehicle.name}`;
   const desc = [`Scadenza ${t.name}`, m.nextKm > 0 ? `oppure a ${nf(m.nextKm, 0)} km` : '', !m.nextDate ? 'Data stimata in base ai km percorsi.' : ''].filter(Boolean).join('. ');
   const alarm = trig => ['BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsEsc(title)}`, `TRIGGER:${trig}`, 'END:VALARM'];
@@ -1102,9 +1147,9 @@ function renderSettings(el) {
   $$('[data-seg] button').forEach(b => b.onclick = () => {
     st[b.parentElement.dataset.seg] = b.dataset.val; save(); applyTheme(); render();
   });
-  const bindNum = (id, set) => $(id).addEventListener('change', e => { const n = num(e.target.value); if (n >= 0) { set(n); save(); updateBadge(); } else toast('Valore non valido'); });
+  const bindNum = (id, set, parse = num) => $(id).addEventListener('change', e => { const n = parse(e.target.value); if (n >= 0) { set(n); save(); updateBadge(); } else toast('Valore non valido'); });
   bindNum('#sDays', n => st.warnDays = Math.round(n));
-  bindNum('#sKm', n => st.warnKm = Math.round(n));
+  bindNum('#sKm', n => st.warnKm = Math.round(n), numInt);
   bindNum('#sfU', n => st.factors.urban = n);
   bindNum('#sfE', n => st.factors.extra = n);
   bindNum('#sfH', n => st.factors.highway = n);
@@ -1136,7 +1181,7 @@ function renderSettings(el) {
   $('#dReset').onclick = () => {
     if (!confirm('Cancellare tutti i rifornimenti, gli interventi e i veicoli? Fai prima un backup se vuoi conservarli.')) return;
     if (!confirm('Sei sicuro? L\'operazione non si può annullare.')) return;
-    db = defaultDb(); save(); applyTheme(); go('home'); toast('Dati cancellati');
+    db = defaultDb(); resetTripState(); maintFilter = 'all'; save(); applyTheme(); go('home'); toast('Dati cancellati');
   };
   $('#dImp').onclick = () => $('#dFile').click();
   $('#dFile').onchange = async e => {
@@ -1146,7 +1191,7 @@ function renderSettings(el) {
       if (!Array.isArray(d.vehicles) || !Array.isArray(d.fillups)) throw 0;
       if (!confirm('Importare il backup? Sostituirà tutti i dati attuali.')) return;
       if (!d.vehicles.length) throw 0;
-      db = normalize(d); save(); applyTheme(); render(); toast('Backup importato');
+      db = normalize(d); resetTripState(); maintFilter = 'all'; save(); applyTheme(); render(); toast('Backup importato');
     } catch (err) { toast('File di backup non valido'); }
   };
 }
@@ -1205,6 +1250,13 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
 
 applyTheme();
 render();
+navigator.storage?.persist?.().catch(() => {});            // chiede al browser di non eliminare i dati da solo
 if ('serviceWorker' in navigator) {
+  // Una nuova versione ha preso il controllo: si ricarica per usarla subito (non durante un inserimento)
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if ($('#sheet').hidden) location.reload(); else toast('Aggiornamento pronto: chiudi e riapri l\'app');
+    });
+  }
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
